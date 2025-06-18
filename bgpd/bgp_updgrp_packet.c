@@ -745,7 +745,7 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 			 * attr. */
 			total_attr_len = bgp_packet_attribute(NULL, peer, s, adv->baa->attr,
 							      &vecarr, NULL, afi, safi, from, NULL,
-							      NULL, 0, 0, 0);
+							      NULL, 0, 0, 0, path);
 
 			space_remaining =
 				STREAM_CONCAT_REMAIN(s, snlri, STREAM_SIZE(s))
@@ -764,9 +764,11 @@ struct bpacket *subgroup_update_packet(struct update_subgroup *subgrp)
 					subgrp->update_group->id, subgrp->id);
 
 				/* Flush the FIFO update queue */
-				while (adv)
-					adv = bgp_advertise_clean_subgroup(
-						subgrp, adj);
+				while (adv) {
+					struct bgp_adj_out *curr_adj = adv->adj;
+
+					adv = bgp_advertise_clean_subgroup(subgrp, curr_adj);
+				}
 				return NULL;
 			}
 
@@ -1156,7 +1158,7 @@ void subgroup_default_update_packet(struct update_subgroup *subgrp,
 	stream_putw(s, 0);
 	total_attr_len = bgp_packet_attribute(NULL, peer, s, attr, &vecarr, &p, afi, safi, from,
 					      NULL, &label, num_labels, addpath_capable,
-					      BGP_ADDPATH_TX_ID_FOR_DEFAULT_ORIGINATE);
+					      BGP_ADDPATH_TX_ID_FOR_DEFAULT_ORIGINATE, NULL);
 
 	/* Set Total Path Attribute Length. */
 	stream_putw_at(s, pos, total_attr_len);

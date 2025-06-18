@@ -668,8 +668,8 @@ static void show_esi_routes(struct bgp *bgp,
 			if (json)
 				json_path = json_object_new_array();
 
-			route_vty_out(vty, p, pi, 0, SAFI_EVPN, json_path,
-				      false);
+			route_vty_out(vty, p, pi, 0, NULL, SAFI_EVPN,
+				      json_path, false);
 
 			if (json)
 				json_object_array_add(json_paths, json_path);
@@ -768,7 +768,7 @@ static void bgp_evpn_show_routes_mac_ip_es(struct vty *vty, esi_t *esi,
 						     AFI_L2VPN, SAFI_EVPN, RPKI_NOT_BEING_USED,
 						     json_path, NULL, 0);
 			else
-				route_vty_out(vty, &bd->rn->p, pi, 0, SAFI_EVPN,
+				route_vty_out(vty, &bd->rn->p, pi, 0, NULL, SAFI_EVPN,
 					      json_path, false);
 
 			if (json)
@@ -896,7 +896,7 @@ static void show_vni_routes(struct bgp *bgp, struct bgpevpn *vpn,
 						     NULL, 0);
 
 			else
-				route_vty_out(vty, &tmp_p, pi, 0, SAFI_EVPN,
+				route_vty_out(vty, &tmp_p, pi, 0, NULL, SAFI_EVPN,
 					      json_path, false);
 
 			if (json)
@@ -1453,8 +1453,9 @@ static int bgp_show_ethernet_vpn(struct vty *vty, struct prefix_rd *prd,
 				else
 					route_vty_out(vty,
 						      bgp_dest_get_prefix(rm),
-						      pi, no_display, SAFI_EVPN,
-						      json_array, false);
+						      pi, no_display, NULL,
+						      SAFI_EVPN, json_array,
+						      false);
 				no_display = 1;
 			}
 
@@ -1462,22 +1463,22 @@ static int bgp_show_ethernet_vpn(struct vty *vty, struct prefix_rd *prd,
 				output_count++;
 
 			if (use_json && json_array) {
-				const struct prefix *p =
+				const struct prefix *pfx =
 					bgp_dest_get_prefix(rm);
 
 				json_prefix_info = json_object_new_object();
 
 				json_object_string_addf(json_prefix_info,
-							"prefix", "%pFX", p);
+							"prefix", "%pFX", pfx);
 
 				json_object_int_add(json_prefix_info,
-						    "prefixLen", p->prefixlen);
+						    "prefixLen", pfx->prefixlen);
 
 				json_object_object_add(json_prefix_info,
 					"paths", json_array);
 				json_object_object_addf(json_nroute,
 							json_prefix_info,
-							"%pFX", p);
+							"%pFX", pfx);
 				json_array = NULL;
 			}
 		}
@@ -3230,7 +3231,7 @@ static void evpn_show_all_routes(struct vty *vty, struct bgp *bgp, int type,
 							     RPKI_NOT_BEING_USED, json_path, NULL,
 							     0);
 				} else
-					route_vty_out(vty, p, pi, 0, SAFI_EVPN,
+					route_vty_out(vty, p, pi, 0, NULL, SAFI_EVPN,
 						      json_path, false);
 
 				if (json)
@@ -3515,7 +3516,7 @@ static void evpn_set_advertise_all_vni(struct bgp *bgp)
 static void evpn_unset_advertise_all_vni(struct bgp *bgp)
 {
 	bgp->advertise_all_vni = 0;
-	bgp_set_evpn(bgp_get_default());
+	bgp_set_evpn(NULL);
 	bgp_zebra_advertise_all_vni(bgp, bgp->advertise_all_vni);
 	bgp_evpn_cleanup_on_disable(bgp);
 }
@@ -3738,9 +3739,14 @@ DEFUN (no_bgp_evpn_advertise_all_vni,
        "Advertise All local VNIs\n")
 {
 	struct bgp *bgp = VTY_GET_CONTEXT(bgp);
+	struct bgp *bgp_evpn = NULL;
 
 	if (!bgp)
 		return CMD_WARNING;
+	bgp_evpn = bgp_get_evpn();
+	if (!bgp_evpn || bgp_evpn != bgp)
+		return CMD_SUCCESS;
+
 	evpn_unset_advertise_all_vni(bgp);
 	return CMD_SUCCESS;
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-2-Clause
 module frr-zebra {
   yang-version 1.1;
   namespace "http://frrouting.org/yang/zebra";
@@ -193,6 +194,16 @@ module frr-zebra {
     }
     description
       "Type for VTEP flood type.";
+  }
+
+  /* PREF64 only accepts specific prefix lengths */
+  typedef pref64-prefix {
+    type inet:ipv6-prefix {
+      /* rely on inet:ipv6-prefix enforcing validity already */
+      pattern '.*/(96|64|56|48|40|32)';
+    }
+    description
+      "An IPv6 prefix suitable for PREF64 announcement";
   }
 
   /*
@@ -2829,6 +2840,31 @@ module frr-zebra {
             }
           }
         }
+        container pref64 {
+          description
+            "A list of NAT64 prefixes that are placed in the PREF64 option in
+            Router Advertisement messages sent from the interface.";
+          reference
+            "RFC 8781: Discovering PREF64 in Router Advertisements";
+          list pref64-prefix {
+            key "prefix";
+            description
+              "NAT64 prefix details";
+            leaf prefix {
+              type pref64-prefix;
+              description
+                "NAT64 prefix, typically 64:ff9b::/96";
+            }
+            leaf lifetime {
+              type uint16;
+              units "seconds";
+              description
+                "Lifetime of the NAT64 prefix to be placed in RAs.
+		If omitted, the lifetime will be calculated automatically as
+		MaxRtrAdvInterval * 3";
+            }
+          }
+        }
       }
       leaf ptm-enable {
         if-feature ptm-bfd;
@@ -3045,17 +3081,6 @@ module frr-zebra {
   container zebra {
     description
       "Data model for the Zebra daemon.";
-    leaf max-multipath {
-      type uint16 {
-        range "1..65535";
-      }
-      config false;
-      description
-        "The maximum number of nexthops for a route.  At this point it
-         is unlikely that a multipath number will ever get larger then
-         1024 but to allow for future expansions, the yang returns a
-         16 bit number";
-    }
     leaf ip-forwarding {
       type boolean;
       description
@@ -3158,6 +3183,16 @@ module frr-zebra {
       config false;
       description
         "Operational data.";
+      leaf max-multipath {
+        type uint16 {
+          range "1..65535";
+        }
+        description
+          "The maximum number of nexthops for a route.  At this point it
+           is unlikely that a multipath number will ever get larger then
+           1024 but to allow for future expansions, the yang returns a
+           16 bit number";
+      }
       leaf ip-forwarding {
         type boolean;
         description

@@ -121,7 +121,24 @@ unsigned int bgp_suppress_fib_count;
 static void bgp_if_finish(struct bgp *bgp);
 static void peer_drop_dynamic_neighbor(struct peer *peer);
 
-extern struct zclient *zclient;
+extern struct zclient *bgp_zclient;
+
+static bool bgp_has_remaining_instances(const struct bgp *bgp)
+{
+	struct listnode *node;
+	struct bgp *bgp_next;
+
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp_next)) {
+		if (bgp_next == bgp)
+			continue;
+		if (bgp->vrf_id != bgp_next->vrf_id)
+			continue;
+
+		return true;
+	}
+
+	return false;
+}
 
 /* handle main socket creation or deletion */
 static int bgp_check_main_socket(bool create, struct bgp *bgp)
@@ -146,6 +163,9 @@ static int bgp_check_main_socket(bool create, struct bgp *bgp)
 	}
 	if (!bgp_server_main_created)
 		return 0;
+	if (bgp_has_remaining_instances(bgp))
+		return 0;
+
 	bgp_close();
 	bgp_server_main_created = 0;
 	return 0;
@@ -447,9 +467,9 @@ void bm_wait_for_fib_set(bool set)
 			send_msg = true;
 	}
 
-	if (send_msg && zclient)
+	if (send_msg && bgp_zclient)
 		zebra_route_notify_send(ZEBRA_ROUTE_NOTIFY_REQUEST,
-					zclient, set);
+					bgp_zclient, set);
 
 	/*
 	 * If this is configed at a time when peers are already set
@@ -507,9 +527,9 @@ void bgp_suppress_fib_pending_set(struct bgp *bgp, bool set)
 		if (BGP_DEBUG(zebra, ZEBRA))
 			zlog_debug("Sending ZEBRA_ROUTE_NOTIFY_REQUEST");
 
-		if (zclient)
+		if (bgp_zclient)
 			zebra_route_notify_send(ZEBRA_ROUTE_NOTIFY_REQUEST,
-					zclient, set);
+					bgp_zclient, set);
 	}
 
 	/*
@@ -1210,6 +1230,7 @@ const char *bgp_peer_get_connection_direction(struct peer_connection *connection
 	}
 
 	assert(!"DEV Escape: Expected switch to take care of this state");
+	return "DEV ESCAPE";
 }
 
 struct peer_connection *bgp_peer_connection_new(struct peer *peer)
@@ -1498,6 +1519,7 @@ int bgp_peer_gr_init(struct peer *peer)
 static void bgp_srv6_init(struct bgp *bgp)
 {
 	bgp->srv6_enabled = false;
+	bgp->srv6_encap_behavior = SRV6_HEADEND_BEHAVIOR_H_ENCAPS;
 	memset(bgp->srv6_locator_name, 0, sizeof(bgp->srv6_locator_name));
 	bgp->srv6_locator_chunks = list_new();
 	bgp->srv6_locator_chunks->del = srv6_locator_chunk_list_free;
@@ -1532,6 +1554,9 @@ static void bgp_srv6_cleanup(struct bgp *bgp)
 	if (bgp->tovpn_sid != NULL) {
 		sid_unregister(bgp, bgp->tovpn_sid);
 		XFREE(MTYPE_BGP_SRV6_SID, bgp->tovpn_sid);
+	}
+	if (bgp->tovpn_sid_explicit != NULL) {
+		XFREE(MTYPE_BGP_SRV6_SID, bgp->tovpn_sid_explicit);
 	}
 
 	if (bgp->srv6_locator_chunks)
@@ -2672,16 +2697,16 @@ void peer_nsf_stop(struct peer *peer)
 
 	FOREACH_AFI_SAFI_NSF (afi, safi) {
 		peer->nsf[afi][safi] = 0;
-		EVENT_OFF(peer->t_llgr_stale[afi][safi]);
+		event_cancel(&peer->t_llgr_stale[afi][safi]);
 	}
 
 	if (peer->connection->t_gr_restart) {
-		EVENT_OFF(peer->connection->t_gr_restart);
+		event_cancel(&peer->connection->t_gr_restart);
 		if (bgp_debug_neighbor_events(peer))
 			zlog_debug("%pBP graceful restart timer stopped", peer);
 	}
 	if (peer->connection->t_gr_stale) {
-		EVENT_OFF(peer->connection->t_gr_stale);
+		event_cancel(&peer->connection->t_gr_stale);
 		if (bgp_debug_neighbor_events(peer))
 			zlog_debug(
 				"%pBP graceful restart stalepath timer stopped",
@@ -3490,12 +3515,6 @@ static struct bgp *bgp_create(as_t *as, const char *name,
 				   name, bgp->as_pretty);
 	}
 
-	/* Default the EVPN VRF to the default one */
-	if (inst_type == BGP_INSTANCE_TYPE_DEFAULT && !bgp_master.bgp_evpn) {
-		bgp_lock(bgp);
-		bm->bgp_evpn = bgp;
-	}
-
 	bgp_lock(bgp);
 
 	bgp->allow_martian = false;
@@ -3517,6 +3536,10 @@ static struct bgp *bgp_create(as_t *as, const char *name,
 	if (cmd_domainname_get())
 		bgp->peer_self->domainname =
 			XSTRDUP(MTYPE_BGP_PEER_HOST, cmd_domainname_get());
+	/* for BMP LOC-RIB, enable AS4B encoding */
+	SET_FLAG(bgp->peer_self->cap, PEER_CAP_AS4_RCV);
+	SET_FLAG(bgp->peer_self->cap, PEER_CAP_AS4_ADV);
+
 	bgp->peer = list_new();
 
 peer_init:
@@ -3567,7 +3590,7 @@ peer_init:
 	bgp->dynamic_neighbors_count = 0;
 	bgp->lb_ref_bw = BGP_LINK_BW_REF_BW;
 	bgp->lb_handling = BGP_LINK_BW_ECMP;
-	bgp->reject_as_sets = false;
+	bgp->reject_as_sets = true;
 	bgp->condition_check_period = DEFAULT_CONDITIONAL_ROUTES_POLL_TIME;
 	bgp_addpath_init_bgp_data(&bgp->tx_addpath);
 	bgp->fast_convergence = false;
@@ -3589,7 +3612,8 @@ peer_init:
 		bgp->vpn_policy[afi].tovpn_zebra_vrf_label_last_sent =
 			MPLS_LABEL_NONE;
 
-		bgp->vpn_policy[afi].import_vrf = list_new();
+		if (!bgp->vpn_policy[afi].import_vrf)
+			bgp->vpn_policy[afi].import_vrf = list_new();
 		bgp->vpn_policy[afi].import_vrf->del =
 			bgp_vrf_string_name_delete;
 		if (!hidden) {
@@ -3607,7 +3631,7 @@ peer_init:
 
 	bgp_mplsvpn_nh_label_bind_cache_init(&bgp->mplsvpn_nh_label_bind);
 
-	if (name)
+	if (name && !bgp->name)
 		bgp->name = XSTRDUP(MTYPE_BGP_NAME, name);
 
 	event_add_timer(bm->master, bgp_startup_timer_expire, bgp,
@@ -3928,16 +3952,16 @@ static void bgp_zclient_set_redist(afi_t afi, int type, unsigned short instance,
 {
 	if (instance) {
 		if (set)
-			redist_add_instance(&zclient->mi_redist[afi][type],
+			redist_add_instance(&bgp_zclient->mi_redist[afi][type],
 					    instance);
 		else
-			redist_del_instance(&zclient->mi_redist[afi][type],
+			redist_del_instance(&bgp_zclient->mi_redist[afi][type],
 					    instance);
 	} else {
 		if (set)
-			vrf_bitmap_set(&zclient->redist[afi][type], vrf_id);
+			vrf_bitmap_set(&bgp_zclient->redist[afi][type], vrf_id);
 		else
-			vrf_bitmap_unset(&zclient->redist[afi][type], vrf_id);
+			vrf_bitmap_unset(&bgp_zclient->redist[afi][type], vrf_id);
 	}
 }
 
@@ -4008,7 +4032,7 @@ void bgp_instance_down(struct bgp *bgp)
 
 	/* Stop timers. */
 	if (bgp->t_rmap_def_originate_eval)
-		EVENT_OFF(bgp->t_rmap_def_originate_eval);
+		event_cancel(&bgp->t_rmap_def_originate_eval);
 
 	/* Bring down peers, so corresponding routes are purged. */
 	for (ALL_LIST_ELEMENTS(bgp->peer, node, next, peer)) {
@@ -4121,6 +4145,7 @@ int bgp_delete(struct bgp *bgp)
 	 */
 	bgp->tovpn_sid_index = 0;
 	UNSET_FLAG(bgp->vrf_flags, BGP_VRF_TOVPN_SID_AUTO);
+	UNSET_FLAG(bgp->vrf_flags, BGP_VRF_TOVPN_SID_EXPLICIT);
 	delete_vrf_tovpn_sid_per_vrf(bgp_default, bgp);
 	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
 		bgp->vpn_policy[afi].tovpn_sid_index = 0;
@@ -4146,14 +4171,14 @@ int bgp_delete(struct bgp *bgp)
 	hook_call(bgp_inst_delete, bgp);
 
 	FOREACH_AFI_SAFI (afi, safi)
-		EVENT_OFF(bgp->t_revalidate[afi][safi]);
+		event_cancel(&bgp->t_revalidate[afi][safi]);
 
-	EVENT_OFF(bgp->t_condition_check);
-	EVENT_OFF(bgp->t_startup);
-	EVENT_OFF(bgp->t_maxmed_onstartup);
-	EVENT_OFF(bgp->t_update_delay);
-	EVENT_OFF(bgp->t_establish_wait);
-	EVENT_OFF(bgp->clearing_end);
+	event_cancel(&bgp->t_condition_check);
+	event_cancel(&bgp->t_startup);
+	event_cancel(&bgp->t_maxmed_onstartup);
+	event_cancel(&bgp->t_update_delay);
+	event_cancel(&bgp->t_establish_wait);
+	event_cancel(&bgp->clearing_end);
 
 	/* Set flag indicating bgp instance delete in progress */
 	SET_FLAG(bgp->flags, BGP_FLAG_DELETE_IN_PROGRESS);
@@ -4171,7 +4196,7 @@ int bgp_delete(struct bgp *bgp)
 
 			XFREE(MTYPE_TMP, info);
 		}
-		EVENT_OFF(gr_info->t_select_deferral);
+		event_cancel(&gr_info->t_select_deferral);
 
 		t = gr_info->t_route_select;
 		if (t) {
@@ -4179,7 +4204,7 @@ int bgp_delete(struct bgp *bgp)
 
 			XFREE(MTYPE_TMP, info);
 		}
-		EVENT_OFF(gr_info->t_route_select);
+		event_cancel(&gr_info->t_route_select);
 	}
 
 	/* Delete route flap dampening configuration */
@@ -4208,7 +4233,7 @@ int bgp_delete(struct bgp *bgp)
 	}
 
 	/* unmap from RT list */
-	if (!IS_BGP_INSTANCE_HIDDEN(bgp))
+	if (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating)
 		bgp_evpn_vrf_delete(bgp);
 
 	/* unmap bgp vrf label */
@@ -4217,7 +4242,7 @@ int bgp_delete(struct bgp *bgp)
 
 	/* Stop timers. */
 	if (bgp->t_rmap_def_originate_eval)
-		EVENT_OFF(bgp->t_rmap_def_originate_eval);
+		event_cancel(&bgp->t_rmap_def_originate_eval);
 
 	/* Inform peers we're going down. */
 	for (ALL_LIST_ELEMENTS(bgp->peer, node, next, peer))
@@ -4264,7 +4289,7 @@ int bgp_delete(struct bgp *bgp)
 		}
 	}
 
-	if (bgp->peer_self && !IS_BGP_INSTANCE_HIDDEN(bgp)) {
+	if (bgp->peer_self && (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating)) {
 		peer_delete(bgp->peer_self);
 		bgp->peer_self = NULL;
 	}
@@ -4272,7 +4297,7 @@ int bgp_delete(struct bgp *bgp)
 	update_bgp_group_free(bgp);
 
 	/* Cancel peer connection errors event */
-	EVENT_OFF(bgp->t_conn_errors);
+	event_cancel(&bgp->t_conn_errors);
 
 	/* Cleanup for peer connection batching */
 	while ((cinfo = bgp_clearing_info_pop(&bgp->clearing_list)) != NULL)
@@ -4281,7 +4306,7 @@ int bgp_delete(struct bgp *bgp)
 /* TODO - Other memory may need to be freed - e.g., NHT */
 
 #ifdef ENABLE_BGP_VNC
-	if (!IS_BGP_INSTANCE_HIDDEN(bgp))
+	if (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating)
 		rfapi_delete(bgp);
 #endif
 
@@ -4289,8 +4314,7 @@ int bgp_delete(struct bgp *bgp)
 	FOREACH_AFI_SAFI (afi, safi) {
 		struct bgp_aggregate *aggregate = NULL;
 
-		for (struct bgp_dest *dest =
-			     bgp_table_top(bgp->aggregate[afi][safi]);
+		for (dest = bgp_table_top(bgp->aggregate[afi][safi]);
 		     dest; dest = bgp_route_next(dest)) {
 			aggregate = bgp_dest_get_bgp_aggregate_info(dest);
 			if (aggregate == NULL)
@@ -4332,7 +4356,7 @@ int bgp_delete(struct bgp *bgp)
 		bgp_zebra_instance_deregister(bgp);
 	}
 
-	if (!IS_BGP_INSTANCE_HIDDEN(bgp)) {
+	if (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating) {
 		/* Remove visibility via the master list -
 		 * there may however still be routes to be processed
 		 * still referencing the struct bgp.
@@ -4344,7 +4368,7 @@ int bgp_delete(struct bgp *bgp)
 
 	vrf = bgp_vrf_lookup_by_instance_type(bgp);
 	bgp_handle_socket(bgp, vrf, VRF_UNKNOWN, false);
-	if (vrf && !IS_BGP_INSTANCE_HIDDEN(bgp))
+	if (vrf && (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating))
 		bgp_vrf_unlink(bgp, vrf);
 
 	/* Update EVPN VRF pointer */
@@ -4355,7 +4379,7 @@ int bgp_delete(struct bgp *bgp)
 			bgp_set_evpn(bgp_get_default());
 	}
 
-	if (!IS_BGP_INSTANCE_HIDDEN(bgp)) {
+	if (!IS_BGP_INSTANCE_HIDDEN(bgp) || bm->terminating) {
 		if (bgp->process_queue)
 			work_queue_free_and_null(&bgp->process_queue);
 		bgp_unlock(bgp); /* initial reference */
@@ -4789,8 +4813,13 @@ enum bgp_peer_active peer_active(struct peer_connection *connection)
 		return BGP_PEER_CONNECTION_UNSPECIFIED;
 
 	if (peer->bfd_config) {
-		if (peer_established(connection) && bfd_session_is_down(peer->bfd_config->session))
-			return BGP_PEER_BFD_DOWN;
+		/* Only if `neighbor X bfd strict` is enabled */
+		if (peergroup_flag_check(peer, PEER_FLAG_BFD_STRICT)) {
+			if (bfd_session_is_admin_down(peer->bfd_config->session))
+				return BGP_PEER_BFD_ADMIN_DOWN;
+			else if (bfd_session_is_down(peer->bfd_config->session))
+				return BGP_PEER_BFD_DOWN;
+		}
 	}
 
 	if (peer->afc[AFI_IP][SAFI_UNICAST] || peer->afc[AFI_IP][SAFI_MULTICAST]
@@ -4947,6 +4976,9 @@ static const struct peer_flag_action peer_flag_action_list[] = {
 	{PEER_FLAG_LONESOUL, 0, peer_change_reset_out},
 	{PEER_FLAG_TCP_MSS, 0, peer_change_none},
 	{PEER_FLAG_CAPABILITY_LINK_LOCAL, 0, peer_change_none},
+	{PEER_FLAG_BFD_STRICT, 0, peer_change_none},
+	{PEER_FLAG_SEND_NHC_ATTRIBUTE, 0, peer_change_none},
+	{PEER_FLAG_IP_TRANSPARENT, 0, peer_change_reset},
 	{0, 0, 0}};
 
 static const struct peer_flag_action peer_af_flag_action_list[] = {
@@ -5052,7 +5084,7 @@ static void peer_flag_modify_action(struct peer *peer, uint64_t flag)
 			UNSET_FLAG(peer->sflags, PEER_STATUS_PREFIX_OVERFLOW);
 
 			if (peer->connection->t_pmax_restart) {
-				EVENT_OFF(peer->connection->t_pmax_restart);
+				event_cancel(&peer->connection->t_pmax_restart);
 				if (bgp_debug_neighbor_events(peer))
 					zlog_debug(
 						"%pBP Maximum-prefix restart timer canceled",
@@ -5169,6 +5201,11 @@ void bgp_shutdown_disable(struct bgp *bgp)
 	/* informational log message */
 	zlog_info("Disabled administrative shutdown on BGP instance AS %u",
 		  bgp->as);
+
+	/* Reactive the startup timer so peers send R-bit. */
+	event_cancel(&bgp->t_startup);
+	event_add_timer(bm->master, bgp_startup_timer_expire, bgp, bgp->restart_time,
+			&bgp->t_startup);
 
 	/* clear the BGP instances shutdown flag */
 	UNSET_FLAG(bgp->flags, BGP_FLAG_SHUTDOWN);
@@ -8040,7 +8077,7 @@ static bool peer_maximum_prefix_clear_overflow(struct peer *peer)
 
 	UNSET_FLAG(peer->sflags, PEER_STATUS_PREFIX_OVERFLOW);
 	if (peer->connection->t_pmax_restart) {
-		EVENT_OFF(peer->connection->t_pmax_restart);
+		event_cancel(&peer->connection->t_pmax_restart);
 		if (bgp_debug_neighbor_events(peer))
 			zlog_debug(
 				"%pBP Maximum-prefix restart timer cancelled",
@@ -8964,15 +9001,15 @@ void bgp_terminate(void)
 	if (bm->listen_sockets)
 		list_delete(&bm->listen_sockets);
 
-	EVENT_OFF(bm->t_rmap_update);
-	EVENT_OFF(bm->t_bgp_sync_label_manager);
-	EVENT_OFF(bm->t_bgp_start_label_manager);
-	EVENT_OFF(bm->t_bgp_zebra_route);
-	EVENT_OFF(bm->t_bgp_zebra_l2_vni);
-	EVENT_OFF(bm->t_bgp_zebra_l3_vni);
+	event_cancel(&bm->t_rmap_update);
+	event_cancel(&bm->t_bgp_sync_label_manager);
+	event_cancel(&bm->t_bgp_start_label_manager);
+	event_cancel(&bm->t_bgp_zebra_route);
+	event_cancel(&bm->t_bgp_zebra_l2_vni);
+	event_cancel(&bm->t_bgp_zebra_l3_vni);
 
 	bgp_mac_finish();
-#if ENABLE_BGP_VNC
+#ifdef ENABLE_BGP_VNC
 	rfapi_terminate();
 #endif
 }
@@ -9184,7 +9221,7 @@ void bgp_clearing_batch_end_event_start(struct bgp *bgp)
 	if (!event_is_scheduled(bgp->clearing_end))
 		bgp_lock(bgp);
 
-	EVENT_OFF(bgp->clearing_end);
+	event_cancel(&bgp->clearing_end);
 	event_add_timer_msec(bm->master, bgp_clearing_batch_end_event, bgp, 100, &bgp->clearing_end);
 }
 

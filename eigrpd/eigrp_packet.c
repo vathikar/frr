@@ -12,6 +12,10 @@
 
 #include <zebra.h>
 
+#ifndef __linux__
+#include <net/if_dl.h>
+#endif
+
 #include "frrevent.h"
 #include "memory.h"
 #include "linklist.h"
@@ -923,7 +927,7 @@ void eigrp_packet_free(struct eigrp_packet *ep)
 	if (ep->s)
 		stream_free(ep->s);
 
-	EVENT_OFF(ep->t_retrans_timer);
+	event_cancel(&ep->t_retrans_timer);
 
 	XFREE(MTYPE_EIGRP_PACKET, ep);
 }
@@ -1110,7 +1114,7 @@ struct TLV_IPv4_Internal_type *eigrp_read_ipv4_tlv(struct stream *s)
 
 	tlv->prefix_length = stream_getc(s);
 
-	destination_tmp = stream_getc(s) << 24;
+	destination_tmp = (uint32_t)stream_getc(s) << 24;
 	if (tlv->prefix_length > 8)
 		destination_tmp |= stream_getc(s) << 16;
 	if (tlv->prefix_length > 16)

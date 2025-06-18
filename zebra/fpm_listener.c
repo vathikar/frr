@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
 
 #ifdef GNU_LINUX
 #include <stdint.h>
@@ -33,12 +34,77 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/if_link.h>
+#include <linux/nexthop.h>
 
 #include "rt_netlink.h"
 #include "fpm/fpm.h"
 #include "lib/libfrr.h"
+#include "zebra/kernel_netlink.h"
 
 XREF_SETUP();
+
+PREDECL_RBTREE_UNIQ(fpm_route);
+PREDECL_HASH(fpm_nhg);
+
+/* Route structure to store in RB tree */
+struct fpm_route {
+	struct prefix prefix;
+	uint32_t table_id;
+	uint32_t nhg_id;
+	struct fpm_route_item rb_item;
+};
+
+/* Comparison function for routes */
+static int fpm_route_cmp(const struct fpm_route *a, const struct fpm_route *b)
+{
+	int ret;
+
+	/* First compare table IDs */
+	if (a->table_id < b->table_id)
+		return -1;
+	if (a->table_id > b->table_id)
+		return 1;
+
+	/* Then compare prefixes */
+	ret = prefix_cmp(&a->prefix, &b->prefix);
+	return ret;
+}
+
+/* RB tree for storing routes */
+DECLARE_RBTREE_UNIQ(fpm_route, struct fpm_route, rb_item, fpm_route_cmp);
+
+/* Nexthop group structure to store in Hash table */
+struct fpm_nhg {
+	uint32_t id;	      /* Nexthop group ID */
+	uint8_t family;	      /* Address family */
+	uint8_t protocol;     /* Routing protocol that installed nhg */
+	uint8_t scope;	      /* Scope */
+	bool is_blackhole;    /* Is this a blackhole nexthop? */
+	uint8_t num_nexthops; /* Number of nexthops in the group */
+
+	/* Individual nexthops in the group */
+	struct {
+		uint32_t id;	   /* Nexthop ID */
+		uint8_t weight;	   /* Weight of this nexthop */
+	} nexthops[MULTIPATH_NUM]; /* Support up to MULTIPATH_NUM nexthops in a group */
+
+	struct fpm_nhg_item hash_item;
+};
+
+/* Comparison function for nexthop groups */
+static int fpm_nhg_cmp(const struct fpm_nhg *a, const struct fpm_nhg *b)
+{
+	return a->id - b->id;
+}
+
+/* Hash function for nexthop groups */
+static uint32_t fpm_nhg_hash(const struct fpm_nhg *a)
+{
+	return jhash_1word(a->id, 0x55aa5a5a);
+}
+
+/* Hash table for storing nexthop groups */
+DECLARE_HASH(fpm_nhg, struct fpm_nhg, hash_item, fpm_nhg_cmp, fpm_nhg_hash);
 
 struct glob {
 	int server_sock;
@@ -47,6 +113,9 @@ struct glob {
 	bool reflect_fail_all;
 	bool dump_hex;
 	FILE *output_file;
+	const char *dump_file;
+	struct fpm_route_head route_tree;
+	struct fpm_nhg_head nhg_hash;
 };
 
 struct glob glob_space;
@@ -309,8 +378,6 @@ netlink_prot_to_s(unsigned char prot)
 	}
 }
 
-#define MAX_NHS 16
-
 struct netlink_nh {
 	struct rtattr *gateway;
 	int if_index;
@@ -330,7 +397,7 @@ struct netlink_msg_ctx {
 	/*
 	 * Nexthops.
 	 */
-	struct netlink_nh nhs[MAX_NHS];
+	struct netlink_nh nhs[MULTIPATH_NUM];
 	unsigned long num_nhs;
 
 	struct rtattr *dest;
@@ -572,6 +639,102 @@ static int parse_route_msg(struct netlink_msg_ctx *ctx)
 	return 1;
 }
 
+/* Forward declaration for handle_nexthop_update */
+static void handle_nexthop_update(struct nlmsghdr *hdr, struct nhmsg *nhmsg, struct rtattr *tb[],
+				  bool is_add);
+
+/*
+ * parse_nexthop_msg
+ */
+static int parse_nexthop_msg(struct nlmsghdr *hdr)
+{
+	struct nhmsg *nhmsg;
+	struct rtattr *tb[NHA_MAX + 1] = {};
+	int len;
+	uint32_t nhgid = 0;
+	uint8_t nhg_count = 0;
+	const char *err_msg = NULL;
+	char protocol_str[32] = "Unknown";
+	char nexthop_buf[16192] = "";
+	size_t buf_pos = 0;
+
+	nhmsg = NLMSG_DATA(hdr);
+	len = hdr->nlmsg_len - NLMSG_LENGTH(sizeof(*nhmsg));
+	if (len < 0) {
+		fprintf(stderr, "Bad nexthop message length\n");
+		return 0;
+	}
+
+	if (!parse_rtattrs_(RTM_NHA(nhmsg), len, tb, ARRAY_SIZE(tb), &err_msg)) {
+		fprintf(stderr, "Error parsing nexthop attributes: %s\n", err_msg);
+		return 0;
+	}
+
+	/* Get protocol string */
+	snprintf(protocol_str, sizeof(protocol_str), "%s(%u)",
+		 netlink_prot_to_s(nhmsg->nh_protocol), nhmsg->nh_protocol);
+
+	/* Get Nexthop Group ID */
+	if (tb[NHA_ID])
+		nhgid = *(uint32_t *)RTA_DATA(tb[NHA_ID]);
+
+	/* Count nexthops in the group and collect NH IDs */
+	if (tb[NHA_GROUP]) {
+		struct nexthop_grp *nhg = (struct nexthop_grp *)RTA_DATA(tb[NHA_GROUP]);
+		size_t count = (RTA_PAYLOAD(tb[NHA_GROUP]) / sizeof(*nhg));
+
+		if (count > 0 && (count * sizeof(*nhg)) == RTA_PAYLOAD(tb[NHA_GROUP])) {
+			nhg_count = count > MULTIPATH_NUM ? MULTIPATH_NUM
+							  : count; /* Limit to our array size */
+
+			/* Build a string with all nexthop IDs and their weights */
+			buf_pos = 0;
+			for (size_t i = 0; i < count; i++) {
+				int len_written;
+				if (i > 0)
+					nexthop_buf[buf_pos++] = ',';
+
+				if (nhg[i].weight > 1)
+					len_written = snprintf(nexthop_buf + buf_pos,
+							       sizeof(nexthop_buf) - buf_pos,
+							       " %u(w:%u)", nhg[i].id,
+							       nhg[i].weight);
+				else
+					len_written = snprintf(nexthop_buf + buf_pos,
+							       sizeof(nexthop_buf) - buf_pos, " %u",
+							       nhg[i].id);
+
+				if (len_written > 0)
+					buf_pos += len_written;
+			}
+			nexthop_buf[buf_pos] = '\0';
+		}
+	} else if (tb[NHA_OIF] || tb[NHA_GATEWAY]) {
+		/* Single nexthop case */
+		nhg_count = 1;
+		snprintf(nexthop_buf, sizeof(nexthop_buf), " Singleton");
+	}
+
+	/* Print blackhole status if applicable */
+	if (tb[NHA_BLACKHOLE]) {
+		fprintf(glob->output_file,
+			"[%s] %s Nexthop Group ID: %u, Protocol: %s, Type: BLACKHOLE, Family: %u\n",
+			get_timestamp(), hdr->nlmsg_type == RTM_NEWNEXTHOP ? "New" : "Del", nhgid,
+			protocol_str, nhmsg->nh_family);
+	} else {
+		fprintf(glob->output_file,
+			"[%s] %s Nexthop Group ID: %u, Protocol: %s, Contains %u nexthops, Family: %u, Scope: %u\n"
+			"    Nexthops:%s\n",
+			get_timestamp(), hdr->nlmsg_type == RTM_NEWNEXTHOP ? "New" : "Del", nhgid,
+			protocol_str, nhg_count, nhmsg->nh_family, nhmsg->nh_scope, nexthop_buf);
+	}
+
+	/* Update the nexthop hash table */
+	handle_nexthop_update(hdr, nhmsg, tb, hdr->nlmsg_type == RTM_NEWNEXTHOP);
+
+	return 1;
+}
+
 /*
  * addr_to_s
  */
@@ -695,6 +858,162 @@ static void fpm_listener_hexdump(const void *mem, size_t len)
 }
 
 /*
+ * handle_route_update
+ * Handles adding or removing a route from the route tree
+ */
+static void handle_route_update(struct netlink_msg_ctx *ctx, bool is_add)
+{
+	struct fpm_route *route;
+	struct fpm_route *existing;
+	struct fpm_route lookup = { 0 };
+
+	if (!ctx->dest || !ctx->rtmsg)
+		return;
+
+	/* Set up lookup key */
+	lookup.prefix.family = ctx->rtmsg->rtm_family;
+	lookup.prefix.prefixlen = ctx->rtmsg->rtm_dst_len;
+	memcpy(&lookup.prefix.u.prefix, RTA_DATA(ctx->dest),
+	       (ctx->rtmsg->rtm_family == AF_INET) ? 4 : 16);
+	lookup.table_id = ctx->rtmsg->rtm_table;
+	lookup.nhg_id = ctx->nhgid ? *ctx->nhgid : 0;
+	/* Look up existing route */
+	existing = fpm_route_find(&glob->route_tree, &lookup);
+
+	if (is_add) {
+		if (existing) {
+			/* Route exists, update it */
+			existing->prefix = lookup.prefix;
+			existing->table_id = lookup.table_id;
+			existing->nhg_id = lookup.nhg_id;
+		} else {
+			/* Create new route structure */
+			route = calloc(1, sizeof(struct fpm_route));
+			if (!route) {
+				fprintf(stderr, "Failed to allocate route structure\n");
+				return;
+			}
+
+			/* Copy prefix information */
+			route->prefix = lookup.prefix;
+			route->table_id = lookup.table_id;
+			route->nhg_id = lookup.nhg_id;
+
+			/* Add route to tree */
+			if (fpm_route_add(&glob->route_tree, route)) {
+				fprintf(stderr, "Failed to add route to tree\n");
+				free(route);
+			}
+		}
+	} else {
+		/* Remove route from tree */
+		if (existing) {
+			existing = fpm_route_del(&glob->route_tree, existing);
+			if (existing)
+				free(existing);
+		}
+	}
+}
+
+/*
+ * handle_nexthop_update
+ * Handles adding or removing a nexthop group from the nexthop hash
+ */
+static void handle_nexthop_update(struct nlmsghdr *hdr, struct nhmsg *nhmsg, struct rtattr *tb[],
+				  bool is_add)
+{
+	struct fpm_nhg *nhg;
+	struct fpm_nhg *existing;
+	struct fpm_nhg lookup = { 0 };
+	uint32_t nhgid = 0;
+	uint8_t nhg_count = 0;
+
+	/* Get Nexthop Group ID */
+	if (tb[NHA_ID])
+		nhgid = *(uint32_t *)RTA_DATA(tb[NHA_ID]);
+	else
+		return; /* Can't process without an ID */
+
+	/* Count nexthops in the group */
+	if (tb[NHA_GROUP]) {
+		size_t count = (RTA_PAYLOAD(tb[NHA_GROUP]) / sizeof(struct nexthop_group));
+
+		if (count > 0 &&
+		    (count * sizeof(struct nexthop_group)) == RTA_PAYLOAD(tb[NHA_GROUP]))
+			nhg_count = count > MULTIPATH_NUM ? MULTIPATH_NUM
+							  : count; /* Limit to our array size */
+	} else if (tb[NHA_OIF] || tb[NHA_GATEWAY]) {
+		/* Single nexthop case */
+		nhg_count = 1;
+	}
+
+	/* Set up lookup key */
+	lookup.id = nhgid;
+
+	/* Look up existing nexthop group */
+	existing = fpm_nhg_find(&glob->nhg_hash, &lookup);
+
+	if (is_add) {
+		if (existing) {
+			/* Nexthop group exists, update it */
+			existing->family = nhmsg->nh_family;
+			existing->protocol = nhmsg->nh_protocol;
+			existing->scope = nhmsg->nh_scope;
+			existing->is_blackhole = tb[NHA_BLACKHOLE] ? true : false;
+			existing->num_nexthops = nhg_count;
+
+			/* Update individual nexthop IDs and weights */
+			if (tb[NHA_GROUP]) {
+				struct nexthop_grp *nhgrp =
+					(struct nexthop_grp *)RTA_DATA(tb[NHA_GROUP]);
+				for (size_t i = 0; i < nhg_count; i++) {
+					existing->nexthops[i].id = nhgrp[i].id;
+					existing->nexthops[i].weight = nhgrp[i].weight;
+				}
+			}
+		} else {
+			/* Create new nexthop group */
+			nhg = calloc(1, sizeof(struct fpm_nhg));
+			if (!nhg) {
+				fprintf(stderr, "Failed to allocate nexthop group structure\n");
+				return;
+			}
+
+			/* Copy nexthop group information */
+			nhg->id = nhgid;
+			nhg->family = nhmsg->nh_family;
+			nhg->protocol = nhmsg->nh_protocol;
+			nhg->scope = nhmsg->nh_scope;
+			nhg->is_blackhole = tb[NHA_BLACKHOLE] ? true : false;
+			nhg->num_nexthops = nhg_count;
+
+			/* Store individual nexthop IDs and weights */
+			if (tb[NHA_GROUP]) {
+				struct nexthop_grp *nhgrp =
+					(struct nexthop_grp *)RTA_DATA(tb[NHA_GROUP]);
+				for (size_t i = 0; i < nhg_count; i++) {
+					nhg->nexthops[i].id = nhgrp[i].id;
+					nhg->nexthops[i].weight = nhgrp[i].weight;
+				}
+			}
+
+			/* Add nexthop group to hash */
+			if (fpm_nhg_add(&glob->nhg_hash, nhg)) {
+				fprintf(stderr, "Failed to add nexthop group to hash\n");
+				free(nhg);
+			}
+		}
+	} else {
+		/* Remove nexthop group from hash */
+		if (existing) {
+			existing = fpm_nhg_del(&glob->nhg_hash, existing);
+			if (existing)
+				free(existing);
+		}
+	}
+}
+
+/*
  * parse_netlink_msg
  */
 static void parse_netlink_msg(char *buf, size_t buf_len, fpm_msg_hdr_t *fpm)
@@ -726,6 +1045,7 @@ static void parse_netlink_msg(char *buf, size_t buf_len, fpm_msg_hdr_t *fpm)
 			}
 
 			print_netlink_msg_ctx(ctx);
+			handle_route_update(ctx, hdr->nlmsg_type == RTM_NEWROUTE);
 
 			if (glob->reflect && hdr->nlmsg_type == RTM_NEWROUTE &&
 			    ctx->rtmsg->rtm_protocol > RTPROT_STATIC) {
@@ -740,6 +1060,11 @@ static void parse_netlink_msg(char *buf, size_t buf_len, fpm_msg_hdr_t *fpm)
 					ctx->rtmsg->rtm_flags |= RTM_F_OFFLOAD;
 				write(glob->sock, fpm, fpm_msg_len(fpm));
 			}
+			break;
+
+		case RTM_NEWNEXTHOP:
+		case RTM_DELNEXTHOP:
+			parse_nexthop_msg(hdr);
 			break;
 
 		default:
@@ -786,17 +1111,101 @@ static void fpm_serve(void)
 	}
 }
 
+/* Signal handler for SIGUSR1 */
+static void sigusr1_handler(int signum)
+{
+	struct fpm_route *route;
+	struct fpm_nhg *nhg;
+	char buf[PREFIX_STRLEN];
+	FILE *out = glob->output_file;
+	FILE *dump_fp = NULL;
+
+	if (glob->dump_file) {
+		dump_fp = fopen(glob->dump_file, "w");
+		if (dump_fp) {
+			out = dump_fp;
+			setbuf(dump_fp, NULL);
+		} else
+			out = glob->output_file;
+	}
+
+	fprintf(out, "\n=== Nexthop Group Hash Dump ===\n");
+	fprintf(out, "Timestamp: %s\n", get_timestamp());
+	fprintf(out, "Total nexthop groups: %zu\n", fpm_nhg_count(&glob->nhg_hash));
+	fprintf(out, "Nexthop Groups:\n");
+
+	frr_each (fpm_nhg, &glob->nhg_hash, nhg) {
+		fprintf(out, "  ID: %u, Protocol: %s(%u), Family: %u, Nexthops: %u %s", nhg->id,
+			netlink_prot_to_s(nhg->protocol), nhg->protocol, nhg->family,
+			nhg->num_nexthops ? nhg->num_nexthops : 1,
+			nhg->is_blackhole ? "BLACKHOLE" : "");
+
+		/* Display individual nexthops if any */
+		if (nhg->num_nexthops > 0 && !nhg->is_blackhole) {
+			if (nhg->nexthops[0].id == 0) {
+				fprintf(out, "\n");
+				continue;
+			}
+
+			fprintf(out, "    Nexthops: ");
+			for (uint8_t i = 0; i < nhg->num_nexthops; i++) {
+				if (i > 0)
+					fprintf(out, ", ");
+
+
+				if (nhg->nexthops[i].weight > 1)
+					fprintf(out, "%u(w:%u)", nhg->nexthops[i].id,
+						nhg->nexthops[i].weight);
+				else
+					fprintf(out, "%u", nhg->nexthops[i].id);
+			}
+			fprintf(out, "\n");
+		}
+	}
+	fprintf(out, "=====================\n\n");
+
+	fprintf(out, "\n=== Route Tree Dump ===\n");
+	fprintf(out, "Timestamp: %s\n", get_timestamp());
+	fprintf(out, "Total routes: %zu\n", fpm_route_count(&glob->route_tree));
+	fprintf(out, "Routes:\n");
+
+	frr_each (fpm_route, &glob->route_tree, route) {
+		prefix2str(&route->prefix, buf, sizeof(buf));
+		fprintf(out, "  Table %u, NHG %u: %s\n", route->table_id, route->nhg_id, buf);
+	}
+	fprintf(out, "=====================\n\n");
+
+
+	fflush(out);
+
+	if (dump_fp)
+		fclose(dump_fp);
+}
+
 int main(int argc, char **argv)
 {
 	pid_t daemon;
 	int r;
 	bool fork_daemon = false;
 	const char *output_file = NULL;
+	struct sigaction sa;
 
 	memset(glob, 0, sizeof(*glob));
 	glob->output_file = stdout;
+	fpm_route_init(&glob->route_tree);
+	fpm_nhg_init(&glob->nhg_hash);
 
-	while ((r = getopt(argc, argv, "rfdvo:")) != -1) {
+	/* Set up signal handler for SIGUSR1 */
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sigusr1_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	if (sigaction(SIGUSR1, &sa, NULL) < 0) {
+		fprintf(stderr, "Failed to set up SIGUSR1 handler: %s\n", strerror(errno));
+		exit(1);
+	}
+
+	while ((r = getopt(argc, argv, "rfdvo:z:")) != -1) {
 		switch (r) {
 		case 'r':
 			glob->reflect = true;
@@ -812,6 +1221,9 @@ int main(int argc, char **argv)
 			break;
 		case 'o':
 			output_file = optarg;
+			break;
+		case 'z':
+			glob->dump_file = optarg;
 			break;
 		}
 	}

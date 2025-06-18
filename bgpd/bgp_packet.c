@@ -453,6 +453,7 @@ void bgp_generate_updgrp_packets(struct event *thread)
 	uint32_t generated = 0;
 	afi_t afi;
 	safi_t safi;
+	enum bgp_af_index index;
 
 	wpq = atomic_load_explicit(&peer->bgp->wpkt_quanta,
 				   memory_order_relaxed);
@@ -469,8 +470,23 @@ void bgp_generate_updgrp_packets(struct event *thread)
 	    || bgp_update_delay_active(peer->bgp))
 		return;
 
-	if (peer->connection->t_routeadv)
+	if (peer->connection->t_routeadv) {
+		/* If MRAI is running, we have to hint "adj-rib-out" to
+		 * ignore suppression of updates for this peer, because
+		 * if we don't, we will miss some updates that are very
+		 * quick (flapping/= del/add) during the MRAI wait time.
+		 */
+		for (index = BGP_AF_START; index < BGP_AF_MAX; index++) {
+			paf = peer->peer_af_array[index];
+			if (!paf)
+				continue;
+
+			if (paf && paf->subgroup)
+				SET_FLAG(paf->subgroup->sflags, SUBGRP_STATUS_FORCE_UPDATES);
+		}
+
 		return;
+	}
 
 	/*
 	 * Since the following is a do while loop
@@ -483,8 +499,6 @@ void bgp_generate_updgrp_packets(struct event *thread)
 	}
 
 	do {
-		enum bgp_af_index index;
-
 		s = NULL;
 		for (index = BGP_AF_START; index < BGP_AF_MAX; index++) {
 			paf = peer->peer_af_array[index];
@@ -601,8 +615,8 @@ void bgp_generate_updgrp_packets(struct event *thread)
 			bgp_packet_add(connection, peer, s);
 			bpacket_queue_advance_peer(paf);
 		}
-	} while (s && (++generated < wpq) &&
-		 (connection->obuf->count <= bm->outq_limit));
+	} while (s && (++generated < wpq) && (connection->obuf->count <= bm->outq_limit) &&
+		 !event_should_yield(thread));
 
 	if (generated)
 		bgp_writes_on(connection);
@@ -2531,7 +2545,7 @@ static int bgp_update_receive(struct peer_connection *connection,
 							gr_info->t_select_deferral);
 						XFREE(MTYPE_TMP, info);
 					}
-					EVENT_OFF(gr_info->t_select_deferral);
+					event_cancel(&gr_info->t_select_deferral);
 					gr_info->eor_required = 0;
 					gr_info->eor_received = 0;
 					/* Best path selection */
@@ -3055,7 +3069,7 @@ static int bgp_route_refresh_receive(struct peer_connection *connection,
 			return BGP_PACKET_NOOP;
 		}
 
-		EVENT_OFF(peer->t_refresh_stalepath);
+		event_cancel(&peer->t_refresh_stalepath);
 
 		SET_FLAG(peer->af_sflags[afi][safi], PEER_STATUS_EORR_RECEIVED);
 		UNSET_FLAG(peer->af_sflags[afi][safi],
@@ -3148,8 +3162,6 @@ static void bgp_dynamic_capability_paths_limit(uint8_t *pnt, int action,
 		SET_FLAG(peer->cap, PEER_CAP_PATHS_LIMIT_RCV);
 
 		while (data + CAPABILITY_CODE_PATHS_LIMIT_LEN <= end) {
-			afi_t afi;
-			safi_t safi;
 			iana_afi_t pkt_afi;
 			iana_safi_t pkt_safi;
 			uint16_t paths_limit = 0;
@@ -3508,8 +3520,6 @@ static void bgp_dynamic_capability_llgr(uint8_t *pnt, int action,
 		SET_FLAG(peer->cap, PEER_CAP_LLGR_RCV);
 
 		while (data + BGP_CAP_LLGR_MIN_PACKET_LEN <= end) {
-			afi_t afi;
-			safi_t safi;
 			iana_afi_t pkt_afi;
 			iana_safi_t pkt_safi;
 			struct graceful_restart_af graf;
@@ -3616,8 +3626,6 @@ static void bgp_dynamic_capability_graceful_restart(uint8_t *pnt, int action,
 
 		while (data + GRACEFUL_RESTART_CAPABILITY_PER_AFI_SAFI_SIZE <=
 		       end) {
-			afi_t afi;
-			safi_t safi;
 			iana_afi_t pkt_afi;
 			iana_safi_t pkt_safi;
 			struct graceful_restart_af graf;
@@ -4001,7 +4009,7 @@ void bgp_process_packet(struct event *thread)
 	uint32_t processed = 0, curr_connection_processed = 0;
 	bool more_work = false;
 	size_t count;
-	uint32_t total_packets_to_process, total_processed = 0;
+	uint32_t total_packets_to_process;
 
 	frr_with_mutex (&bm->peer_connection_mtx)
 		connection = peer_connection_fifo_pop(&bm->connection_fifo);
@@ -4017,7 +4025,6 @@ void bgp_process_packet(struct event *thread)
 	fsm_update_result = 0;
 
 	while ((processed < total_packets_to_process) && connection) {
-		total_processed++;
 		/* Guard against scheduled events that occur after peer deletion. */
 		if (connection->status == Deleted || connection->status == Clearing) {
 			frr_with_mutex (&bm->peer_connection_mtx)

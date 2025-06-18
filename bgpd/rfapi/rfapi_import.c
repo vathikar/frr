@@ -850,7 +850,7 @@ static void rfapiBgpInfoChainFree(struct bgp_path_info *bpi)
 
 			rwcb_del(&_rwcbhash, wcb);
 			XFREE(MTYPE_RFAPI_WITHDRAW, wcb);
-			EVENT_OFF(bpi->extra->vnc->vnc.import.timer);
+			event_cancel(&bpi->extra->vnc->vnc.import.timer);
 		}
 
 		next = bpi->next;
@@ -1352,11 +1352,11 @@ rfapiRouteInfo2NextHopEntry(struct rfapi_ip_prefix *rprefix,
 
 	bgp_attr_extcom_tunnel_type(bpi->attr, &tun_type);
 	if (tun_type == BGP_ENCAP_TYPE_MPLS) {
-		struct prefix p;
+		struct prefix pfx;
 		/* MPLS carries UN address in next hop */
-		rfapiNexthop2Prefix(bpi->attr, &p);
-		if (p.family != AF_UNSPEC) {
-			rfapiQprefix2Raddr(&p, &new->un_address);
+		rfapiNexthop2Prefix(bpi->attr, &pfx);
+		if (pfx.family != AF_UNSPEC) {
+			rfapiQprefix2Raddr(&pfx, &new->un_address);
 			have_vnc_tunnel_un = 1;
 		}
 	}
@@ -1773,7 +1773,7 @@ struct rfapi_next_hop_entry *rfapiRouteNode2NextHopList(
 	 * Add non-withdrawn routes from less-specific prefix
 	 */
 	if (parent) {
-		const struct prefix *p = agg_node_get_prefix(parent);
+		p = agg_node_get_prefix(parent);
 
 		rib_rn = rfd_rib_table ? agg_node_get(rfd_rib_table, p) : NULL;
 		rfapiQprefix2Rprefix(p, &rprefix);
@@ -3088,7 +3088,7 @@ static void rfapiBgpInfoFilteredImportEncap(
 
 					rwcb_del(&_rwcbhash, wcb);
 					XFREE(MTYPE_RFAPI_WITHDRAW, wcb);
-					EVENT_OFF(bpi->extra->vnc->vnc.import
+					event_cancel(&bpi->extra->vnc->vnc.import
 							  .timer);
 				}
 
@@ -3182,7 +3182,7 @@ static void rfapiBgpInfoFilteredImportEncap(
 
 			rwcb_del(&_rwcbhash, wcb);
 			XFREE(MTYPE_RFAPI_WITHDRAW, wcb);
-			EVENT_OFF(bpi->extra->vnc->vnc.import.timer);
+			event_cancel(&bpi->extra->vnc->vnc.import.timer);
 		}
 		rfapiExpireEncapNow(import_table, rn, bpi);
 	}
@@ -3224,7 +3224,7 @@ static void rfapiBgpInfoFilteredImportEncap(
 				       __func__, rn);
 #endif
 		for (m = RFAPI_MONITOR_ENCAP(rn); m; m = m->next) {
-			const struct prefix *p;
+			const struct prefix *pfx;
 
 			/*
 			 * For each referenced bpi/route, copy the ENCAP route's
@@ -3252,9 +3252,9 @@ static void rfapiBgpInfoFilteredImportEncap(
 			 * list
 			 * per prefix.
 			 */
-			p = agg_node_get_prefix(m->node);
+			pfx = agg_node_get_prefix(m->node);
 			referenced_vpn_prefix =
-				agg_node_get(referenced_vpn_table, p);
+				agg_node_get(referenced_vpn_table, pfx);
 			assert(referenced_vpn_prefix);
 			for (mnext = referenced_vpn_prefix->info; mnext;
 			     mnext = mnext->next) {
@@ -3545,7 +3545,7 @@ void rfapiBgpInfoFilteredImportVPN(
 
 					rwcb_del(&_rwcbhash, wcb);
 					XFREE(MTYPE_RFAPI_WITHDRAW, wcb);
-					EVENT_OFF(bpi->extra->vnc->vnc.import
+					event_cancel(&bpi->extra->vnc->vnc.import
 							  .timer);
 
 					import_table->holddown_count[afi] -= 1;
@@ -3765,7 +3765,7 @@ void rfapiBgpInfoFilteredImportVPN(
 
 			rwcb_del(&_rwcbhash, wcb);
 			XFREE(MTYPE_RFAPI_WITHDRAW, wcb);
-			EVENT_OFF(bpi->extra->vnc->vnc.import.timer);
+			event_cancel(&bpi->extra->vnc->vnc.import.timer);
 		}
 		rfapiExpireVpnNow(import_table, rn, bpi, 0);
 	}
@@ -3844,6 +3844,7 @@ rfapiBgpInfoFilteredImportFunction(safi_t safi)
 	}
 
 	assert(!"Reached end of function when we were not expecting to");
+	return NULL;
 }
 
 void rfapiProcessUpdate(struct peer *peer,
@@ -4518,7 +4519,7 @@ static void rfapiDeleteRemotePrefixesIt(
 						rwcb_del(&_rwcbhash, wcb);
 						XFREE(MTYPE_RFAPI_WITHDRAW,
 						      wcb);
-						EVENT_OFF(bpi->extra->vnc->vnc
+						event_cancel(&bpi->extra->vnc->vnc
 								  .import.timer);
 					}
 				} else {
@@ -4862,7 +4863,7 @@ void rfapi_import_terminate(void)
 	while ((wcb = rwcb_pop(&_rwcbhash))) {
 		bpi = wcb->info;
 		assert(wcb == EVENT_ARG(bpi->extra->vnc->vnc.import.timer));
-		EVENT_OFF(bpi->extra->vnc->vnc.import.timer);
+		event_cancel(&bpi->extra->vnc->vnc.import.timer);
 
 		timer_service_func = wcb->timer_service_func;
 		memset(&t, 0, sizeof(t));

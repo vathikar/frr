@@ -15,6 +15,7 @@
 #include "jhash.h"
 #include "queue.h"
 #include "filter.h"
+#include "frregex_real.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_aspath.h"
@@ -1265,7 +1266,7 @@ struct aspath *aspath_replace_regex_asn(struct aspath *aspath,
 
 	while (cur_seg) {
 		cur_as_list = acl_list;
-		while (cur_as_list) {
+		if (cur_as_list) {
 			cur_as_filter = cur_as_list->head;
 			while (cur_as_filter) {
 				for (i = 0; i < cur_seg->length; i++) {
@@ -1273,13 +1274,11 @@ struct aspath *aspath_replace_regex_asn(struct aspath *aspath,
 						   ASPATH_STR_DEFAULT_LEN,
 						   ASN_FORMAT(new->asnotation),
 						   &cur_seg->as[i]);
-					if (!regexec(cur_as_filter->reg,
-						     str_buf, 0, NULL, 0))
+					if (!regexec(&cur_as_filter->reg->real, str_buf, 0, NULL, 0))
 						cur_seg->as[i] = our_asn;
 				}
 				cur_as_filter = cur_as_filter->next;
 			}
-			cur_as_list = cur_as_list->next;
 		}
 		cur_seg = cur_seg->next;
 	}
@@ -1751,8 +1750,8 @@ struct aspath *aspath_filter_exclude_acl(struct aspath *source,
 						   ASPATH_STR_DEFAULT_LEN,
 						   ASN_FORMAT(source->asnotation),
 						   &cur_seg->as[i]);
-					if (!regexec(cur_as_filter->reg,
-						     str_buf, 0, NULL, 0)) {
+					if (!regexec(&cur_as_filter->reg->real, str_buf, 0, NULL,
+						     0)) {
 						cur_seg->as[i] = 0;
 						nb_as_del++;
 					}

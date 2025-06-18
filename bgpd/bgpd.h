@@ -907,6 +907,7 @@ struct bgp {
 #define BGP_VRF_L3VNI_PREFIX_ROUTES_ONLY    (1 << 6)
 /* per-VRF toVPN SID */
 #define BGP_VRF_TOVPN_SID_AUTO              (1 << 7)
+#define BGP_VRF_TOVPN_SID_EXPLICIT	    (1 << 8)
 
 	/* unique ID for auto derivation of RD for this vrf */
 	uint16_t vrf_rd_id;
@@ -956,11 +957,13 @@ struct bgp {
 	/* BGP VPN SRv6 backend */
 	bool srv6_enabled;
 	char srv6_locator_name[SRV6_LOCNAME_SIZE];
+	enum srv6_headend_behavior srv6_encap_behavior;
 	struct srv6_locator *srv6_locator;
 	struct list *srv6_locator_chunks;
 	struct list *srv6_functions;
 	uint32_t tovpn_sid_index; /* unset => set to 0 */
 	struct in6_addr *tovpn_sid;
+	struct in6_addr *tovpn_sid_explicit;
 	struct srv6_locator *tovpn_sid_locator;
 	uint32_t tovpn_sid_transpose_label;
 	struct in6_addr *tovpn_zebra_vrf_sid_last_sent;
@@ -1696,6 +1699,11 @@ struct peer {
 #define PEER_FLAG_CAPABILITY_LINK_LOCAL	  (1ULL << 41)
 /* Peer is part of a batch clearing its routes */
 #define PEER_FLAG_CLEARING_BATCH (1ULL << 42)
+/* BFD strict mode */
+#define PEER_FLAG_BFD_STRICT (1ULL << 43)
+/* https://datatracker.ietf.org/doc/html/draft-ietf-idr-entropy-label */
+#define PEER_FLAG_SEND_NHC_ATTRIBUTE (1ULL << 44)
+#define PEER_FLAG_IP_TRANSPARENT     (1ULL << 45) /* ip-transparent */
 
 	/*
 	 *GR-Disabled mode means unset PEER_FLAG_GRACEFUL_RESTART
@@ -1767,7 +1775,7 @@ struct peer {
 #define PEER_FLAG_SOO (1ULL << 28)
 #define PEER_FLAG_SEND_EXT_COMMUNITY_RPKI (1ULL << 29)
 #define PEER_FLAG_ADDPATH_RX_PATHS_LIMIT (1ULL << 30)
-#define PEER_FLAG_CONFIG_DAMPENING (1U << 31)
+#define PEER_FLAG_CONFIG_DAMPENING (1ULL << 31)
 #define PEER_FLAG_ACCEPT_OWN (1ULL << 63)
 
 	enum bgp_addpath_strat addpath_type[AFI_MAX][SAFI_MAX];
@@ -1792,6 +1800,7 @@ struct peer {
 #define PEER_STATUS_NSF_WAIT          (1U << 6) /* wait comeback peer */
 /* received extended format encoding for OPEN message */
 #define PEER_STATUS_EXT_OPT_PARAMS_LENGTH (1U << 7)
+#define PEER_STATUS_BFD_STRICT_HOLD_TIME_EXPIRED (1U << 8) /* BFD strict hold time expired */
 
 	/* Peer status af flags (reset in bgp_stop) */
 	uint16_t af_sflags[AFI_MAX][SAFI_MAX];
@@ -2055,6 +2064,16 @@ struct peer {
 		char profile[BFD_PROFILE_NAME_LEN];
 		/** Peer BFD session */
 		struct bfd_session_params *session;
+		/* Hold time value used for the BfdHoldTimer.
+		 * The default value for this attribute is 30 seconds and is
+		 * user configurable.
+		 */
+		uint32_t hold_time;
+		/* Hold timer used when the BGP HoldTime has been negotiated
+		 * to zero to ensure the BGP session terminates if the associated
+		 * BFD session does not enter the Up state.
+		 */
+		struct event *t_hold_timer;
 	} * bfd_config;
 
 	/* hostname and domainname advertised by host */
@@ -2201,6 +2220,7 @@ struct bgp_nlri {
 #define BGP_ATTR_AIGP                           26
 #define BGP_ATTR_LARGE_COMMUNITIES              32
 #define BGP_ATTR_OTC                            35
+#define BGP_ATTR_NHC                            39
 #define BGP_ATTR_PREFIX_SID                     40
 #ifdef ENABLE_BGP_VNC_ATTR
 #define BGP_ATTR_VNC                           255
@@ -2435,6 +2455,7 @@ enum bgp_peer_active {
 	BGP_PEER_ACTIVE,
 	BGP_PEER_CONNECTION_UNSPECIFIED,
 	BGP_PEER_BFD_DOWN,
+	BGP_PEER_BFD_ADMIN_DOWN,
 	BGP_PEER_AF_UNCONFIGURED,
 };
 
@@ -2847,6 +2868,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 	}
 
 	assert(!"Reached end of function we should never hit");
+	return BGP_AF_MAX;
 }
 
 /* If the peer is not a peer-group but is bound to a peer-group return 1 */
@@ -2959,11 +2981,11 @@ static inline void bgp_vrf_link(struct bgp *bgp, struct vrf *vrf)
 /* Unlink BGP instance from VRF. */
 static inline void bgp_vrf_unlink(struct bgp *bgp, struct vrf *vrf)
 {
+	bgp->vrf_id = VRF_UNKNOWN;
 	if (vrf->info == (void *)bgp) {
 		vrf->info = NULL;
 		bgp_unlock(bgp);
 	}
-	bgp->vrf_id = VRF_UNKNOWN;
 }
 
 static inline bool bgp_in_graceful_shutdown(struct bgp *bgp)

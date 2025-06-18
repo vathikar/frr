@@ -14,9 +14,7 @@ const char *features[] = {
 #if HAVE_BFDD == 0
 	"ptm-bfd",
 #endif
-#if defined(HAVE_RTADV)
 	"ipv6-router-advertisements",
-#endif
 	NULL
 };
 
@@ -26,7 +24,7 @@ const struct frr_yang_module_info frr_zebra_info = {
 	.features = features,
 	.nodes = {
 		{
-			.xpath = "/frr-zebra:zebra/max-multipath",
+			.xpath = "/frr-zebra:zebra/state/max-multipath",
 			.cbs = {
 				.get_elem = zebra_max_multipath_get_elem,
 			}
@@ -603,7 +601,6 @@ const struct frr_yang_module_info frr_zebra_info = {
 				.modify = lib_interface_zebra_evpn_mh_uplink_modify,
 			}
 		},
-#if defined(HAVE_RTADV)
 		{
 			.xpath = "/frr-interface:lib/interface/frr-zebra:zebra/ipv6-router-advertisements/send-advertisements",
 			.cbs = {
@@ -763,7 +760,20 @@ const struct frr_yang_module_info frr_zebra_info = {
 				.destroy = lib_interface_zebra_ipv6_router_advertisements_rdnss_rdnss_address_lifetime_destroy,
 			}
 		},
-#endif /* defined(HAVE_RTADV) */
+		{
+			.xpath = "/frr-interface:lib/interface/frr-zebra:zebra/ipv6-router-advertisements/pref64/pref64-prefix",
+			.cbs = {
+				.create = lib_interface_zebra_ipv6_router_advertisements_pref64_pref64_prefix_create,
+				.destroy = lib_interface_zebra_ipv6_router_advertisements_pref64_pref64_prefix_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-interface:lib/interface/frr-zebra:zebra/ipv6-router-advertisements/pref64/pref64-prefix/lifetime",
+			.cbs = {
+				.modify = lib_interface_zebra_ipv6_router_advertisements_pref64_pref64_prefix_lifetime_modify,
+				.destroy = lib_interface_zebra_ipv6_router_advertisements_pref64_pref64_prefix_lifetime_destroy,
+			}
+		},
 #if HAVE_BFDD == 0
 		{
 			.xpath = "/frr-interface:lib/interface/frr-zebra:zebra/ptm-enable",
@@ -1099,6 +1109,12 @@ const struct frr_yang_module_info frr_zebra_info = {
 			.xpath = "/frr-vrf:lib/vrf/frr-zebra:zebra/ribs/rib/route/route-entry/nexthop-group/nexthop/srv6-segs-stack/entry/seg",
 			.cbs = {
 				.get_elem = lib_vrf_zebra_ribs_rib_route_route_entry_nexthop_group_nexthop_srv6_segs_stack_entry_seg_get_elem,
+			}
+		},
+		{
+			.xpath = "/frr-vrf:lib/vrf/frr-zebra:zebra/ribs/rib/route/route-entry/nexthop-group/nexthop/srv6-segs-stack/encap-behavior",
+			.cbs = {
+				.get_elem = lib_vrf_zebra_ribs_rib_route_route_entry_nexthop_group_nexthop_srv6_segs_stack_encap_behavior_get_elem,
 			}
 		},
 

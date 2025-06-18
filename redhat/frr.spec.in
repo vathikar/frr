@@ -27,7 +27,6 @@
 %{!?with_pimd:          %global  with_pimd          1 }
 %{!?with_pim6d:         %global  with_pim6d         1 }
 %{!?with_vrrpd:         %global  with_vrrpd         1 }
-%{!?with_rtadv:         %global  with_rtadv         1 }
 %{!?with_watchfrr:      %global  with_watchfrr      1 }
 %{!?with_pathd:         %global  with_pathd         1 }
 %{!?with_grpc:          %global  with_grpc          0 }
@@ -54,7 +53,7 @@
 
 #### Version String tweak
 # Remove invalid characters form version string and replace with _
-%{expand: %%global rpmversion %(echo '@VERSION@' | tr [:blank:]- _ )}
+%{expand: %%global frrmajorversion %(echo '@VERSION@' | tr [:blank:]- _ )}
 %define         frrversion   @VERSION@
 
 #### Check for systemd or init.d (upstart)
@@ -170,7 +169,7 @@
 
 Summary: Routing daemon
 Name:           frr
-Version:        %{rpmversion}
+Version:        %{frrmajorversion}
 Release:        %{release_rev}%{?dist}
 License:        GPLv2+
 Group:          System Environment/Daemons
@@ -338,8 +337,11 @@ Adds GRPC support to the individual FRR daemons.
 
 %build
 
+# Fix issue with D_FORTIFY_SOURCE on newer glibc (See Issue #18575)
+CFLAGS="%{optflags} -DINET_NTOP_NO_OVERRIDE"
+
 # For standard gcc verbosity, uncomment these lines:
-#CFLAGS="%{optflags} -Wall -Wsign-compare -Wpointer-arith"
+#CFLAGS="%{CFLAGS} -Wall -Wsign-compare -Wpointer-arith"
 #CFLAGS="${CFLAGS} -Wbad-function-cast -Wwrite-strings"
 
 # For ultra gcc verbosity, uncomment these lines also:
@@ -370,11 +372,6 @@ Adds GRPC support to the individual FRR daemons.
     --enable-ospfapi \
 %else
     --disable-ospfapi \
-%endif
-%if %{with_rtadv}
-    --enable-rtadv \
-%else
-    --disable-rtadv \
 %endif
 %if %{with_ldpd}
     --enable-ldpd \
@@ -528,7 +525,11 @@ install -d -m750 %{buildroot}%{_runstatedir}/frr
 
 %if 0%{?rhel} > 7 || 0%{?fedora} > 29
 # avoid `ERROR: ambiguous python shebang in` errors
+%if 0%{?rhel} < 10
 pathfix.py -pni "%{__python3} %{py3_shbang_opts}" %{buildroot}/usr/lib/frr/*.py
+%else
+%py3_shebang_fix %{buildroot}/usr/lib/frr/*.py
+%endif
 %py_byte_compile %{__python3} %{buildroot}/usr/lib/frr/*.py
 %else
 # remove ospfclient.py (if present) as it requires > python36
@@ -783,6 +784,7 @@ fi
 %{_libdir}/libfrr_pb.so*
 %{_libdir}/libfrrfpm_pb.so*
 %{_libdir}/libmgmt_be_nb.so*
+%{_libdir}/libmlag_pb.so*
 %{_bindir}/*
 %config(noreplace) %{configdir}/[!v]*.conf*
 %config(noreplace) %attr(750,%{frr_user},%{frr_user}) %{configdir}/daemons
