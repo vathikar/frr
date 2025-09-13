@@ -133,7 +133,8 @@ static bool bgp_has_remaining_instances(const struct bgp *bgp)
 			continue;
 		if (bgp->vrf_id != bgp_next->vrf_id)
 			continue;
-
+		if (!CHECK_FLAG(bgp->flags, BGP_FLAG_VRF_MAY_LISTEN))
+			continue;
 		return true;
 	}
 
@@ -1384,9 +1385,6 @@ struct peer *peer_unlock_with_caller(const char *name, struct peer *peer)
 
 int bgp_global_gr_init(struct bgp *bgp)
 {
-	if (BGP_DEBUG(graceful_restart, GRACEFUL_RESTART))
-		zlog_debug("%s called ..", __func__);
-
 	int local_GLOBAL_GR_FSM[BGP_GLOBAL_GR_MODE][BGP_GLOBAL_GR_EVENT_CMD] = {
 		/* GLOBAL_HELPER Mode  */
 		{
@@ -1456,9 +1454,6 @@ int bgp_global_gr_init(struct bgp *bgp)
 
 int bgp_peer_gr_init(struct peer *peer)
 {
-	if (BGP_DEBUG(graceful_restart, GRACEFUL_RESTART))
-		zlog_debug("%s called ..", __func__);
-
 	struct bgp_peer_gr local_Peer_GR_FSM[BGP_PEER_GR_MODE]
 					[BGP_PEER_GR_EVENT_CMD] = {
 	{
@@ -1518,7 +1513,6 @@ int bgp_peer_gr_init(struct peer *peer)
 
 static void bgp_srv6_init(struct bgp *bgp)
 {
-	bgp->srv6_enabled = false;
 	bgp->srv6_encap_behavior = SRV6_HEADEND_BEHAVIOR_H_ENCAPS;
 	memset(bgp->srv6_locator_name, 0, sizeof(bgp->srv6_locator_name));
 	bgp->srv6_locator_chunks = list_new();
@@ -1543,6 +1537,8 @@ static void bgp_srv6_cleanup(struct bgp *bgp)
 			XFREE(MTYPE_BGP_SRV6_SID,
 			      bgp->vpn_policy[afi].tovpn_sid);
 		}
+		if (bgp->vpn_policy[afi].tovpn_sid_explicit)
+			XFREE(MTYPE_BGP_SRV6_SID, bgp->vpn_policy[afi].tovpn_sid_explicit);
 	}
 
 	if (bgp->tovpn_sid_locator != NULL) {
@@ -1566,6 +1562,29 @@ static void bgp_srv6_cleanup(struct bgp *bgp)
 
 	srv6_locator_free(bgp->srv6_locator);
 	bgp->srv6_locator = NULL;
+}
+
+bool bgp_srv6_locator_is_configured(struct bgp *bgp)
+{
+	return (bgp->srv6_locator_name[0] != '\0');
+}
+
+/**
+ * Return the SRv6 locator used for exported path from bgp_vrf
+ *
+ * @param bgp_vrf BGP VRF instance
+ * @param bgp default BGP instance
+ * @return srv6_locator
+ * If bgp_vrf has any locator available, return it
+ * otherwise fallback to the default VRF.
+ */
+struct srv6_locator *bgp_srv6_locator_lookup(struct bgp *bgp_vrf, struct bgp *bgp)
+{
+	if (bgp_vrf && bgp_vrf->srv6_locator)
+		return bgp_vrf->srv6_locator;
+	if (bgp && bgp->srv6_locator)
+		return bgp->srv6_locator;
+	return NULL;
 }
 
 /* Allocate new peer object, implicitely locked.  */
@@ -3098,6 +3117,15 @@ int peer_group_remote_as(struct bgp *bgp, const char *group_name, as_t *as,
 	peer_as_change(group->conf, *as, as_type, as_str);
 
 	for (ALL_LIST_ELEMENTS(group->peer, node, nnode, peer)) {
+		/*
+		 * Re-initiate RA for BGP unnumbered peers when peer group gets
+		 * remote-as configured. This ensures RA is restored after
+		 * peer_group_remote_as_delete() terminated it
+		 */
+		if (peer->conf_if && peer->ifp &&
+		    CHECK_FLAG(peer->flags, PEER_FLAG_CAPABILITY_ENHE))
+			bgp_zebra_initiate_radv(peer->bgp, peer);
+
 		if (((peer->as_type == AS_SPECIFIED) && peer->as != *as) ||
 		    (peer->as_type != as_type)) {
 			peer_as_change(peer, *as, as_type, as_str);
@@ -3307,6 +3335,7 @@ int peer_group_listen_range_del(struct peer_group *group, struct prefix *range)
 	if (group->conf->password)
 		bgp_md5_unset_prefix(group->bgp, prefix);
 
+	prefix_free(&prefix);
 	return 0;
 }
 
@@ -3515,6 +3544,12 @@ static struct bgp *bgp_create(as_t *as, const char *name,
 				   name, bgp->as_pretty);
 	}
 
+	/* Default the EVPN VRF to the default one */
+	if (inst_type == BGP_INSTANCE_TYPE_DEFAULT && !bgp_master.bgp_evpn) {
+		bgp_lock(bgp);
+		bm->bgp_evpn = bgp;
+	}
+
 	bgp_lock(bgp);
 
 	bgp->allow_martian = false;
@@ -3536,7 +3571,10 @@ static struct bgp *bgp_create(as_t *as, const char *name,
 	if (cmd_domainname_get())
 		bgp->peer_self->domainname =
 			XSTRDUP(MTYPE_BGP_PEER_HOST, cmd_domainname_get());
-	/* for BMP LOC-RIB, enable AS4B encoding */
+	/* for BMP LOC-RIB */
+	/* copy bgp as to peer as */
+	bgp->peer_self->local_as = bgp->as;
+	/* enable AS4B encoding */
 	SET_FLAG(bgp->peer_self->cap, PEER_CAP_AS4_RCV);
 	SET_FLAG(bgp->peer_self->cap, PEER_CAP_AS4_ADV);
 
@@ -3566,11 +3604,10 @@ peer_init:
 		bgp_maximum_paths_set(bgp, afi, safi, BGP_PEER_IBGP,
 				      multipath_num, 0);
 		/* Initialize graceful restart info */
-		bgp->gr_info[afi][safi].eor_required = 0;
-		bgp->gr_info[afi][safi].eor_received = 0;
 		bgp->gr_info[afi][safi].t_select_deferral = NULL;
 		bgp->gr_info[afi][safi].t_route_select = NULL;
 		bgp->gr_info[afi][safi].gr_deferred = 0;
+		bgp->gr_info[afi][safi].select_defer_over = false;
 	}
 
 	bgp->v_update_delay = bm->v_update_delay;
@@ -3800,6 +3837,8 @@ int bgp_handle_socket(struct bgp *bgp, struct vrf *vrf, vrf_id_t old_vrf_id,
 		}
 		if (vrf == NULL)
 			return BGP_ERR_INVALID_VALUE;
+		if (!CHECK_FLAG(bgp->flags, BGP_FLAG_VRF_MAY_LISTEN))
+			return 0;
 		/* do nothing
 		 * if vrf_id did not change
 		 */
@@ -4070,13 +4109,11 @@ int bgp_delete(struct bgp *bgp)
 	struct bgp_dest *dest_next = NULL;
 	struct bgp_table *dest_table = NULL;
 	struct graceful_restart_info *gr_info;
-	uint32_t b_ann_cnt = 0, b_l2_cnt = 0, b_l3_cnt = 0;
-	uint32_t a_ann_cnt = 0, a_l2_cnt = 0, a_l3_cnt = 0;
-	struct bgp *bgp_to_proc = NULL;
-	struct bgp *bgp_to_proc_next = NULL;
 	struct bgp *bgp_default = bgp_get_default();
 	struct bgp_clearing_info *cinfo;
 	struct peer_connection *connection;
+	uint32_t b_ann_cnt = 0, b_l2_cnt = 0;
+	uint32_t a_ann_cnt = 0, a_l2_cnt = 0;
 
 	assert(bgp);
 
@@ -4110,21 +4147,11 @@ int bgp_delete(struct bgp *bgp)
 		}
 	}
 
-	b_l3_cnt = zebra_l3_vni_count(&bm->zebra_l3_vni_head);
-	for (bgp_to_proc = zebra_l3_vni_first(&bm->zebra_l3_vni_head); bgp_to_proc;
-	     bgp_to_proc = bgp_to_proc_next) {
-		bgp_to_proc_next = zebra_l3_vni_next(&bm->zebra_l3_vni_head, bgp_to_proc);
-		if (bgp_to_proc == bgp)
-			zebra_l3_vni_del(&bm->zebra_l3_vni_head, bgp_to_proc);
-	}
-
 	if (BGP_DEBUG(zebra, ZEBRA)) {
 		a_ann_cnt = zebra_announce_count(&bm->zebra_announce_head);
 		a_l2_cnt = zebra_l2_vni_count(&bm->zebra_l2_vni_head);
-		a_l3_cnt = zebra_l3_vni_count(&bm->zebra_l3_vni_head);
-		zlog_debug("BGP %s deletion FIFO cnt Zebra_Ann before %u after %u, L2_VNI before %u after, %u L3_VNI before %u after %u",
-			   bgp->name_pretty, b_ann_cnt, a_ann_cnt, b_l2_cnt, a_l2_cnt, b_l3_cnt,
-			   a_l3_cnt);
+		zlog_debug("FIFO Cleanup Count during BGP %s deletion :: Zebra Announce - before %u after %u :: BGP L2_VNI - before %u after %u",
+			   bgp->name_pretty, b_ann_cnt, a_ann_cnt, b_l2_cnt, a_l2_cnt);
 	}
 
 	/* Cleanup for peer connection batching */
@@ -4941,45 +4968,47 @@ struct peer_flag_action {
 };
 
 static const struct peer_flag_action peer_flag_action_list[] = {
-	{PEER_FLAG_PASSIVE, 0, peer_change_reset},
-	{PEER_FLAG_SHUTDOWN, 0, peer_change_reset},
-	{PEER_FLAG_RTT_SHUTDOWN, 0, peer_change_none},
-	{PEER_FLAG_DONT_CAPABILITY, 0, peer_change_none},
-	{PEER_FLAG_OVERRIDE_CAPABILITY, 0, peer_change_none},
-	{PEER_FLAG_STRICT_CAP_MATCH, 0, peer_change_none},
-	{PEER_FLAG_DYNAMIC_CAPABILITY, 0, peer_change_none},
-	{PEER_FLAG_DISABLE_CONNECTED_CHECK, 0, peer_change_reset},
-	{PEER_FLAG_CAPABILITY_ENHE, 0, peer_change_reset},
-	{PEER_FLAG_ENFORCE_FIRST_AS, 0, peer_change_reset_in},
-	{PEER_FLAG_IFPEER_V6ONLY, 0, peer_change_reset},
-	{PEER_FLAG_ROUTEADV, 0, peer_change_none},
-	{PEER_FLAG_TIMER, 0, peer_change_none},
-	{PEER_FLAG_TIMER_CONNECT, 0, peer_change_none},
-	{PEER_FLAG_TIMER_DELAYOPEN, 0, peer_change_none},
-	{PEER_FLAG_PASSWORD, 0, peer_change_none},
-	{PEER_FLAG_LOCAL_AS, 0, peer_change_reset},
-	{PEER_FLAG_LOCAL_AS_NO_PREPEND, 0, peer_change_reset},
-	{PEER_FLAG_LOCAL_AS_REPLACE_AS, 0, peer_change_reset},
-	{PEER_FLAG_DUAL_AS, 0, peer_change_reset},
-	{PEER_FLAG_UPDATE_SOURCE, 0, peer_change_none},
-	{PEER_FLAG_DISABLE_LINK_BW_ENCODING_IEEE, 0, peer_change_none},
-	{PEER_FLAG_EXTENDED_OPT_PARAMS, 0, peer_change_reset},
-	{PEER_FLAG_ROLE_STRICT_MODE, 0, peer_change_none},
-	{PEER_FLAG_ROLE, 0, peer_change_none},
-	{PEER_FLAG_PORT, 0, peer_change_reset},
-	{PEER_FLAG_AIGP, 0, peer_change_none},
-	{PEER_FLAG_GRACEFUL_SHUTDOWN, 0, peer_change_none},
-	{PEER_FLAG_CAPABILITY_SOFT_VERSION, 0, peer_change_none},
-	{PEER_FLAG_CAPABILITY_FQDN, 0, peer_change_none},
-	{PEER_FLAG_AS_LOOP_DETECTION, 0, peer_change_none},
-	{PEER_FLAG_EXTENDED_LINK_BANDWIDTH, 0, peer_change_none},
-	{PEER_FLAG_LONESOUL, 0, peer_change_reset_out},
-	{PEER_FLAG_TCP_MSS, 0, peer_change_none},
-	{PEER_FLAG_CAPABILITY_LINK_LOCAL, 0, peer_change_none},
-	{PEER_FLAG_BFD_STRICT, 0, peer_change_none},
-	{PEER_FLAG_SEND_NHC_ATTRIBUTE, 0, peer_change_none},
-	{PEER_FLAG_IP_TRANSPARENT, 0, peer_change_reset},
-	{0, 0, 0}};
+	{ PEER_FLAG_PASSIVE, 0, peer_change_reset },
+	{ PEER_FLAG_SHUTDOWN, 0, peer_change_reset },
+	{ PEER_FLAG_RTT_SHUTDOWN, 0, peer_change_none },
+	{ PEER_FLAG_DONT_CAPABILITY, 0, peer_change_none },
+	{ PEER_FLAG_OVERRIDE_CAPABILITY, 0, peer_change_none },
+	{ PEER_FLAG_STRICT_CAP_MATCH, 0, peer_change_none },
+	{ PEER_FLAG_DYNAMIC_CAPABILITY, 0, peer_change_none },
+	{ PEER_FLAG_DISABLE_CONNECTED_CHECK, 0, peer_change_reset },
+	{ PEER_FLAG_CAPABILITY_ENHE, 0, peer_change_reset },
+	{ PEER_FLAG_ENFORCE_FIRST_AS, 0, peer_change_reset_in },
+	{ PEER_FLAG_IFPEER_V6ONLY, 0, peer_change_reset },
+	{ PEER_FLAG_ROUTEADV, 0, peer_change_none },
+	{ PEER_FLAG_TIMER, 0, peer_change_none },
+	{ PEER_FLAG_TIMER_CONNECT, 0, peer_change_none },
+	{ PEER_FLAG_TIMER_DELAYOPEN, 0, peer_change_none },
+	{ PEER_FLAG_PASSWORD, 0, peer_change_none },
+	{ PEER_FLAG_LOCAL_AS, 0, peer_change_reset },
+	{ PEER_FLAG_LOCAL_AS_NO_PREPEND, 0, peer_change_reset },
+	{ PEER_FLAG_LOCAL_AS_REPLACE_AS, 0, peer_change_reset },
+	{ PEER_FLAG_DUAL_AS, 0, peer_change_reset },
+	{ PEER_FLAG_UPDATE_SOURCE, 0, peer_change_none },
+	{ PEER_FLAG_DISABLE_LINK_BW_ENCODING_IEEE, 0, peer_change_none },
+	{ PEER_FLAG_EXTENDED_OPT_PARAMS, 0, peer_change_reset },
+	{ PEER_FLAG_ROLE_STRICT_MODE, 0, peer_change_none },
+	{ PEER_FLAG_ROLE, 0, peer_change_none },
+	{ PEER_FLAG_PORT, 0, peer_change_reset },
+	{ PEER_FLAG_AIGP, 0, peer_change_none },
+	{ PEER_FLAG_GRACEFUL_SHUTDOWN, 0, peer_change_none },
+	{ PEER_FLAG_CAPABILITY_SOFT_VERSION, 0, peer_change_none },
+	{ PEER_FLAG_CAPABILITY_FQDN, 0, peer_change_none },
+	{ PEER_FLAG_AS_LOOP_DETECTION, 0, peer_change_none },
+	{ PEER_FLAG_EXTENDED_LINK_BANDWIDTH, 0, peer_change_none },
+	{ PEER_FLAG_LONESOUL, 0, peer_change_reset_out },
+	{ PEER_FLAG_TCP_MSS, 0, peer_change_none },
+	{ PEER_FLAG_CAPABILITY_LINK_LOCAL, 0, peer_change_none },
+	{ PEER_FLAG_BFD_STRICT, 0, peer_change_none },
+	{ PEER_FLAG_RPKI_STRICT, 0, peer_change_none },
+	{ PEER_FLAG_SEND_NHC_ATTRIBUTE, 0, peer_change_none },
+	{ PEER_FLAG_IP_TRANSPARENT, 0, peer_change_reset },
+	{ 0, 0, 0 }
+};
 
 static const struct peer_flag_action peer_af_flag_action_list[] = {
 	{ PEER_FLAG_SEND_COMMUNITY, 1, peer_change_reset_out },
@@ -6944,6 +6973,7 @@ int peer_local_as_set(struct peer *peer, as_t as, bool no_prepend,
 	struct bgp *bgp = peer->bgp;
 	struct peer *member;
 	struct listnode *node, *nnode;
+	bool same_as_str = false;
 
 	if (bgp->as == as)
 		return BGP_ERR_CANNOT_HAVE_LOCAL_AS_SAME_AS;
@@ -6961,8 +6991,11 @@ int peer_local_as_set(struct peer *peer, as_t as, bool no_prepend,
 	peer_flag_modify(peer, PEER_FLAG_LOCAL_AS_REPLACE_AS, replace_as);
 	peer_flag_modify(peer, PEER_FLAG_DUAL_AS, dual_as);
 
+	same_as_str = as_str && peer->change_local_as_pretty &&
+		      !strcmp(as_str, peer->change_local_as_pretty);
+
 	if (peer->change_local_as == as && old_no_prepend == no_prepend &&
-	    old_replace_as == replace_as && old_dual_as == dual_as)
+	    old_replace_as == replace_as && old_dual_as == dual_as && same_as_str)
 		return 0;
 	peer->change_local_as = as;
 	if (as_str) {
@@ -7006,9 +7039,12 @@ int peer_local_as_set(struct peer *peer, as_t as, bool no_prepend,
 			  replace_as);
 		COND_FLAG(member->flags, PEER_FLAG_DUAL_AS, dual_as);
 		member->change_local_as = as;
-		if (as_str)
+		if (as_str) {
+			if (member->change_local_as_pretty)
+				XFREE(MTYPE_BGP_NAME, member->change_local_as_pretty);
 			member->change_local_as_pretty = XSTRDUP(MTYPE_BGP_NAME,
 								 as_str);
+		}
 	}
 
 	return 0;
@@ -8726,7 +8762,6 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 
 	zebra_announce_init(&bm->zebra_announce_head);
 	zebra_l2_vni_init(&bm->zebra_l2_vni_head);
-	zebra_l3_vni_init(&bm->zebra_l3_vni_head);
 	bm->bgp = list_new();
 	bm->listen_sockets = list_new();
 	bm->port = BGP_PORT_DEFAULT;
@@ -8751,7 +8786,6 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	bm->select_defer_time = BGP_DEFAULT_SELECT_DEFERRAL_TIME;
 	bm->rib_stale_time = BGP_DEFAULT_RIB_STALE_TIME;
 	bm->t_bgp_zebra_l2_vni = NULL;
-	bm->t_bgp_zebra_l3_vni = NULL;
 
 	bm->peer_clearing_batch_id = 1;
 	/* TODO -- make these configurable */
@@ -9006,7 +9040,6 @@ void bgp_terminate(void)
 	event_cancel(&bm->t_bgp_start_label_manager);
 	event_cancel(&bm->t_bgp_zebra_route);
 	event_cancel(&bm->t_bgp_zebra_l2_vni);
-	event_cancel(&bm->t_bgp_zebra_l3_vni);
 
 	bgp_mac_finish();
 #ifdef ENABLE_BGP_VNC

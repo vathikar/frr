@@ -49,6 +49,7 @@
 #include "zebra/zapi_msg.h"
 #include "zebra/zebra_dplane.h"
 #include "zebra/zebra_evpn_mh.h"
+#include "zebra/zebra_neigh.h"
 #include "zebra/zebra_script.h"
 
 DEFINE_MGROUP(ZEBRA, "zebra");
@@ -1870,7 +1871,7 @@ no_nexthops:
 			ctxnhg->nexthop != NULL ? "" : " (empty)");
 
 	/* Set the flag about the dedicated fib list */
-	if (zrouter.asic_notification_nexthop_control) {
+	if (zrouter.zav.asic_notification_nexthop_control) {
 		SET_FLAG(re->status, ROUTE_ENTRY_USE_FIB_NHG);
 		if (ctxnhg->nexthop)
 			copy_nexthops(&(re->fib_ng.nexthop), ctxnhg->nexthop,
@@ -2090,13 +2091,12 @@ static void rib_process_result(struct zebra_dplane_ctx *ctx)
 			 * a second async response to the request.  In this case we know
 			 * that we should just mark it as no longer queued at all.
 			 */
-			if (zrouter.asic_offloaded && status == ZEBRA_DPLANE_REQUEST_FAILURE)
+			if (zrouter.zav.asic_offloaded && status == ZEBRA_DPLANE_REQUEST_FAILURE)
 				UNSET_FLAG(re->status, ROUTE_ENTRY_QUEUED);
 
-			if (!zrouter.asic_offloaded ||
+			if (!zrouter.zav.asic_offloaded ||
 			    (CHECK_FLAG(re->flags, ZEBRA_FLAG_OFFLOADED) ||
-			     CHECK_FLAG(re->flags,
-					ZEBRA_FLAG_OFFLOAD_FAILED))) {
+			     CHECK_FLAG(re->flags, ZEBRA_FLAG_OFFLOAD_FAILED))) {
 				UNSET_FLAG(re->status,
 					   ROUTE_ENTRY_ROUTE_REPLACING);
 				UNSET_FLAG(re->status, ROUTE_ENTRY_QUEUED);
@@ -2449,7 +2449,7 @@ static void rib_process_dplane_notify(struct zebra_dplane_ctx *ctx)
 	/* Various fib transitions: changed nexthops; from installed to
 	 * not-installed; or not-installed to installed.
 	 */
-	if (zrouter.asic_notification_nexthop_control) {
+	if (zrouter.zav.asic_notification_nexthop_control) {
 		if (start_count > 0 && end_count > 0) {
 			if (debug_p)
 				zlog_debug(
@@ -2877,8 +2877,7 @@ static void process_subq_early_route_add(struct zebra_early_route *ere)
 
 	same = first_same;
 
-	if (!ere->startup && (re->flags & ZEBRA_FLAG_SELFROUTE) &&
-	    zrouter.asic_offloaded) {
+	if (!ere->startup && (re->flags & ZEBRA_FLAG_SELFROUTE) && zrouter.zav.asic_offloaded) {
 		struct route_entry *entry;
 
 		if (!same) {
@@ -5255,14 +5254,8 @@ static void rib_process_dplane_results(struct event *thread)
 			/* Some op codes not handled here */
 			case DPLANE_OP_ADDR_INSTALL:
 			case DPLANE_OP_ADDR_UNINSTALL:
-			case DPLANE_OP_NEIGH_INSTALL:
-			case DPLANE_OP_NEIGH_UPDATE:
-			case DPLANE_OP_NEIGH_DELETE:
-			case DPLANE_OP_NEIGH_IP_INSTALL:
-			case DPLANE_OP_NEIGH_IP_DELETE:
 			case DPLANE_OP_VTEP_ADD:
 			case DPLANE_OP_VTEP_DELETE:
-			case DPLANE_OP_NEIGH_DISCOVER:
 			case DPLANE_OP_BR_PORT_UPDATE:
 			case DPLANE_OP_NEIGH_TABLE_UPDATE:
 			case DPLANE_OP_GRE_SET:
@@ -5275,6 +5268,15 @@ static void rib_process_dplane_results(struct event *thread)
 
 			case DPLANE_OP_VLAN_INSTALL:
 				zebra_vlan_dplane_result(ctx);
+				break;
+
+			case DPLANE_OP_NEIGH_IP_INSTALL:
+			case DPLANE_OP_NEIGH_IP_DELETE:
+			case DPLANE_OP_NEIGH_INSTALL:
+			case DPLANE_OP_NEIGH_UPDATE:
+			case DPLANE_OP_NEIGH_DELETE:
+			case DPLANE_OP_NEIGH_DISCOVER:
+				zebra_neigh_dplane_update(ctx);
 				break;
 			} /* Dispatch by op code */
 

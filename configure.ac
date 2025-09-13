@@ -837,8 +837,6 @@ AC_ARG_ENABLE([logfile_mask],
   AS_HELP_STRING([--enable-logfile-mask=ARG], [set mask for log files]))
 AC_ARG_ENABLE([realms],
   AS_HELP_STRING([--enable-realms], [enable REALMS support under Linux]))
-AC_ARG_ENABLE([irdp],
-  AS_HELP_STRING([--enable-irdp], [enable IRDP server support in zebra]))
 AC_ARG_ENABLE([capabilities],
   AS_HELP_STRING([--disable-capabilities], [disable using POSIX capabilities]))
 AC_ARG_ENABLE([gcc_ultra_verbose],
@@ -1369,6 +1367,7 @@ dnl ---------------
 AC_CHECK_FUNCS([ \
 	strlcat strlcpy \
 	getgrouplist \
+	getloadavg \
 	openat \
 	unlinkat \
 	posix_fallocate \
@@ -2089,7 +2088,6 @@ dnl gRPC
 dnl ---------------
 if test "$enable_grpc" = "yes"; then
   AC_LANG_PUSH([C++])
-  AX_CXX_COMPILE_STDCXX([11], [ext])
   PKG_CHECK_MODULES([GRPC], [grpc >= 6.0.0 grpc++ >= 1.16.1 protobuf >= 3.6.1 ], [
     AC_CHECK_PROGS([PROTOC], [protoc], [/bin/false])
     if test "$PROTOC" = "/bin/false"; then
@@ -2307,32 +2305,6 @@ AC_CHECK_MEMBERS([struct sockaddr.sa_len,
 	struct sockaddr_dl.sdl_len,
 	struct nd_opt_adv_interval.nd_opt_ai_type],
 	[], [], FRR_INCLUDES)
-
-dnl ---------------------------
-dnl IRDP/pktinfo/icmphdr checks
-dnl ---------------------------
-
-AC_CHECK_TYPE([struct in_pktinfo], [
-  AC_CHECK_TYPES([struct icmphdr], [
-    IRDP=true
-  ], [
-    IRDP=false
-  ], [FRR_INCLUDES])
-], [
-  IRDP=false
-], [FRR_INCLUDES])
-
-case "${enable_irdp}" in
-yes)
-  $IRDP || AC_MSG_ERROR(['IRDP requires in_pktinfo at the moment!'])
-  ;;
-no)
-  IRDP=false
-  ;;
-*)
-  IRDP=false
-  ;;
-esac
 
 
 dnl -----------------------
@@ -2748,7 +2720,6 @@ AM_CONDITIONAL([ZEROMQ], [test "$ZEROMQ" = "true"])
 dnl plugins
 AM_CONDITIONAL([RPKI], [test "$RPKI" = "true"])
 AM_CONDITIONAL([SNMP], [$SNMP])
-AM_CONDITIONAL([IRDP], [$IRDP])
 AM_CONDITIONAL([FPM], [test "$enable_fpm" = "yes"])
 AM_CONDITIONAL([HAVE_PROTOBUF], [test "$enable_protobuf" != "no"])
 AM_CONDITIONAL([HAVE_PROTOBUF3], [$PROTO3])

@@ -1877,7 +1877,10 @@ Configuring Peers
 
    The ``dual-as`` keyword is used to configure the neighbor to establish a peering
    session using the real autonomous-system number (``router bgp ASN``) or by using
-   the autonomous system number configured with the ``local-as``.
+   the autonomous system number configured with the ``local-as``.  If ``dual-as`` is
+   used be aware of connection collision ordering and attempt to configure this system
+   with a higher ip address so that this connection is preferred.  As that the other
+   side will reject the incoming connection.
 
    This command is only allowed for eBGP peers.
 
@@ -3456,15 +3459,26 @@ is accomplished via the following command in the context of a VRF:
 
    Enables a SRv6 SID to be attached to a route exported from the current
    unicast VRF to VPN. A single SID is used for both IPv4 and IPv6 address
-   families. If you want to set a SID for only IPv4 address family or IPv6
-   address family, you need to use the command ``sid vpn export <(1..1048575)|auto|explicit X:X::X:X>``
-   in the context of an address-family. If the value specified is ``auto``,
-   the SID value is automatically assigned from a pool maintained by the Zebra
-   daemon. If the value specified is ``explicit X:X::X:X``, SID allocation
-   with the explicit value is requested from the Zebra daemon.
-   If Zebra is not running, or if this command is not configured, or if SID
-   allocation is failed, automatic or explicit SID assignment will not complete,
-   which will block corresponding route export.
+   families. If the value specified is ``auto``, the SID value is
+   automatically assigned from a pool maintained by the Zebra daemon. If the
+   value specified is ``explicit X:X::X:X``, SID allocation with the explicit
+   value is requested from the Zebra daemon. If Zebra is not running, or if
+   this command is not configured, or if SID allocation is failed, automatic
+   or explicit SID assignment will not complete, which will block corresponding
+   route export.
+
+
+.. clicmd:: sid vpn export <(1..1048575)|auto|explicit X:X::X:X>
+
+   If you want to set a SID for only IPv4 address family or IPv6 address
+   family, the above command can be executed in the context of an
+   address-family. If the value specified is ``auto``, the SID value is
+   automatically assigned from a pool maintained by the Zebra daemon. If the
+   value specified is ``explicit X:X::X:X``, SID allocation with the explicit
+   value is requested from the Zebra daemon. If Zebra is not running, or if
+   this command is not configured, or if SID allocation is failed, automatic
+   or explicit SID assignment will not complete, which will block corresponding
+   route export.
 
 .. _bgp-evpn:
 
@@ -3507,6 +3521,21 @@ default VRF. The command to enable EVPN for a BGP instance is
      advertise-all-vni
 
 A more comprehensive configuration example can be found in the :ref:`evpn` page.
+
+.. _bgp-evpn-bum-handling:
+
+EVPN BUM Handling
+^^^^^^^^^^^^^^^^^
+
+.. clicmd:: flooding <disable|head-end-replication>
+
+This command controls the handling of BUM (Broadcast, Unknown Unicast, and
+Multicast) traffic in EVPN. The default behavior is to flood BUM traffic
+across all VTEPs in the EVPN instance. BUM traffic can also be handled
+per VNI by entering ``vni`` context first.
+
+When ``disable`` is configured, BUM traffic will not be flooded for an arbitrary
+VNI or globally.
 
 .. _bgp-evpn-l3-route-targets:
 
@@ -3641,11 +3670,18 @@ prefix:
 .. clicmd:: advertise <ipv4|ipv6> unicast [gateway-ip]
 
 When this CLI is configured for a BGP vrf under L2VPN EVPN address family, EVPN
-type-5 routes are generated for BGP prefixes in the vrf. Nexthop of the BGP
-prefix becomes the gateway IP of the corresponding type-5 route.
+type-5 routes are generated for BGP prefixes in the vrf.
 
 If the above command is configured without the "gateway-ip" keyword, type-5
-routes are generated without overlay index.
+routes are generated without overlay index, and only the best path for each
+prefix is exported to EVPN.
+
+If the above command is configured with the "gateway-ip" keyword, all paths are
+exported to EVPN using AddPath, and each path's nexthop becomes the gateway IP
+of the corresponding type-5 paths.
+
+Note that EVPN will still perform its own bestpath selection for each EVPN
+prefix, and addpath must be properly configured in EVPN to enable multipathing.
 
 2. Add gateway IP to EVPN type-5 route using a route-map:
 
@@ -4991,6 +5027,12 @@ Displaying Update Group Information
 
    Display Information about update-group events in FRR.
 
+.. clicmd:: show [ip] bgp l2vpn evpn update-groups [subgroup-id (1-1000)] [json]
+
+   Display information about L2VPN EVPN update-groups being used.
+   If subgroup-id is specified, only display information about that particular
+   subgroup. The optional json parameter formats the output as JSON.
+
 Displaying Nexthop Information
 ------------------------------
 .. clicmd:: show [ip] bgp [<view|vrf> VIEWVRFNAME] nexthop ipv4 [A.B.C.D] [detail] [json]
@@ -5042,6 +5084,31 @@ Segment-Routing IPv6
    - name: vrf20
      vpn_policy[AFI_IP].tovpn_sid: none
      vpn_policy[AFI_IP6].tovpn_sid: 2001:db8:1:1::200
+
+.. clicmd:: show bgp ipv6 vpn detail
+
+The SID can be advertised along with other SRv6 fields in the BGP prefix sid
+attribute defined in RFC-9252. The below output displays the SRv6 SID structure
+Sub-Sub-TLV, as per chapter 3.2.1. The `[32 16 32 0 0 0]` values respectively
+stand for the locator block length, node length, function length, argument
+length, and the transposition length and offset.
+
+.. code-block:: frr
+
+   r1# show bgp ipv6 vpn 2001:db9:10::/64
+   BGP routing table entry for 5:10:2001:db9:10::/64, version 2
+   not allocated
+   Paths: (1 available, best #1)
+     Advertised to peers:
+     fc00:0:1::1
+     Local
+       :: from :: (5.5.5.5) vrf vrf10(8) announce-nh-self
+         Origin incomplete, metric 0, weight 32768, valid, sourced, local, best (First path received)
+         Extended Community: RT:99:99
+         Originator: 5.5.5.5
+         Remote label: 3
+         Remote SID: fc05:0:5:cece:2345::, sid structure=[32 16 32 0 0 0]
+         Last update: Wed Jul  2 09:53:59 2025
 
 AS-notation support
 -------------------

@@ -387,7 +387,7 @@ void zebra_evpn_sync_neigh_static_chg(struct zebra_neigh *n, bool old_n_static,
 	if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH)
 		zlog_debug(
 			"sync-neigh ref-chg vni %u ip %pIA mac %pEA f 0x%x %d%s%s%s%s by %s",
-			n->zevpn->vni, &n->ip, &n->emac, n->flags,
+			n->zevpn ? n->zevpn->vni : 0, &n->ip, &n->emac, n->flags,
 			mac->sync_neigh_cnt,
 			old_n_static ? " old_n_static" : "",
 			new_n_static ? " new_n_static" : "",
@@ -424,7 +424,7 @@ static void zebra_evpn_neigh_hold_exp_cb(struct event *t)
 
 	if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH)
 		zlog_debug("sync-neigh vni %u ip %pIA mac %pEA 0x%x hold expired",
-			   n->zevpn->vni, &n->ip, &n->emac, n->flags);
+			   n->zevpn ? n->zevpn->vni : 0, &n->ip, &n->emac, n->flags);
 
 	/* re-program the local neigh in the dataplane if the neigh is no
 	 * longer static
@@ -445,7 +445,7 @@ static inline void zebra_evpn_neigh_start_hold_timer(struct zebra_neigh *n)
 	if (n->hold_timer)
 		return;
 
-	if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH)
+	if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH && n->zevpn)
 		zlog_debug("sync-neigh vni %u ip %pIA mac %pEA 0x%x hold start",
 			   n->zevpn->vni, &n->ip, &n->emac, n->flags);
 	event_add_timer(zrouter.master, zebra_evpn_neigh_hold_exp_cb, n,
@@ -597,9 +597,47 @@ void zebra_evpn_sync_neigh_del(struct zebra_neigh *n)
 	bool old_n_static;
 	bool new_n_static;
 
-	if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH)
+	if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH && n->zevpn)
 		zlog_debug("sync-neigh del vni %u ip %pIA mac %pEA f 0x%x",
 			   n->zevpn->vni, &n->ip, &n->emac, n->flags);
+
+	if (CHECK_FLAG(n->flags, ZEBRA_NEIGH_ES_PEER_ACTIVE)) {
+		struct zebra_ns *zns = NULL;
+		struct interface *ifp = NULL;
+
+		if (n->zevpn && n->zevpn->vxlan_if && n->zevpn->vxlan_if->vrf) {
+			struct zebra_vrf *zvrf = n->zevpn->vxlan_if->vrf->info;
+
+			if (zvrf)
+				zns = zvrf->zns;
+		}
+
+		if (zns)
+			ifp = if_lookup_by_index_per_ns(zns, n->ifindex);
+
+		/* Only start the hold timer if the local interface is operative.
+		 * If the interface is down, ES_PEER_ACTIVE will stay until
+		 * the interface comes up and BGP provides a new update.
+		 */
+
+		if (ifp && if_is_operative(ifp)) {
+			zebra_evpn_neigh_start_hold_timer(n);
+		} else {
+			if (IS_ZEBRA_DEBUG_EVPN_MH_NEIGH) {
+				char if_name_buf[64] = "unknown";
+
+				if (ifp)
+					strlcpy(if_name_buf, ifp->name, sizeof(if_name_buf));
+				else if (n->ifindex != 0)
+					snprintf(if_name_buf, sizeof(if_name_buf), "ifindex %d",
+						 n->ifindex);
+
+				zlog_debug("sync-neigh vni %u ip %pIA DEL: ifp %s (idx %d) is not operative, not starting hold_timer for ES_PEER_ACTIVE flag 0x%x",
+					   n->zevpn ? n->zevpn->vni : 0, &n->ip, if_name_buf,
+					   n->ifindex, n->flags);
+			}
+		}
+	}
 
 	old_n_static = zebra_evpn_neigh_is_static(n);
 	UNSET_FLAG(n->flags, ZEBRA_NEIGH_ES_PEER_PROXY);
@@ -607,7 +645,7 @@ void zebra_evpn_sync_neigh_del(struct zebra_neigh *n)
 		zebra_evpn_neigh_start_hold_timer(n);
 	new_n_static = zebra_evpn_neigh_is_static(n);
 
-	if (old_n_static != new_n_static)
+	if (old_n_static != new_n_static && n->zevpn)
 		zebra_evpn_sync_neigh_static_chg(
 			n, old_n_static, new_n_static, false /*defer-dp*/,
 			false /*defer_mac_dp*/, __func__);
@@ -1881,9 +1919,6 @@ void zebra_evpn_print_neigh_hash(struct hash_bucket *bucket, void *ctxt)
 	json_evpn = wctx->json;
 	n = (struct zebra_neigh *)bucket->data;
 
-	if (json_evpn)
-		json_row = json_object_new_object();
-
 	prefix_mac2str(&n->emac, buf1, sizeof(buf1));
 	ipaddr2str(&n->ip, buf2, sizeof(buf2));
 	state_str = IS_ZEBRA_NEIGH_ACTIVE(n) ? "active" : "inactive";
@@ -1898,6 +1933,8 @@ void zebra_evpn_print_neigh_hash(struct hash_bucket *bucket, void *ctxt)
                     sizeof(flags_buf)), state_str, buf1,
                     "", n->loc_seq, n->rem_seq);
 		} else {
+			json_row = json_object_new_object();
+
 			json_object_string_add(json_row, "type", "local");
 			json_object_string_add(json_row, "state", state_str);
 			json_object_string_add(json_row, "mac", buf1);
@@ -1939,6 +1976,8 @@ void zebra_evpn_print_neigh_hash(struct hash_bucket *bucket, void *ctxt)
 				n->mac->es ? n->mac->es->esi_str : addr_buf,
 				n->loc_seq, n->rem_seq);
 		} else {
+			json_row = json_object_new_object();
+
 			json_object_string_add(json_row, "type", "remote");
 			json_object_string_add(json_row, "state", state_str);
 			json_object_string_add(json_row, "mac", buf1);

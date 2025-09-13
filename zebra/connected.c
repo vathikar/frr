@@ -295,7 +295,7 @@ void connected_up(struct interface *ifp, struct connected *ifc)
 	 * pretend like the route is offloaded so everything
 	 * else will work
 	 */
-	if (zrouter.asic_offloaded)
+	if (zrouter.zav.asic_offloaded)
 		flags |= ZEBRA_FLAG_OFFLOADED;
 
 	/*
@@ -361,7 +361,7 @@ void connected_add_ipv4(struct interface *ifp, int flags,
 	struct prefix_ipv4 *p;
 	struct connected *ifc;
 
-	if (ipv4_martian(addr))
+	if (!ipv4_ietf_unicast_valid(addr))
 		return;
 
 	/* Make connected structure. */

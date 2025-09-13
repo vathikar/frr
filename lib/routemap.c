@@ -2418,7 +2418,7 @@ static void route_map_pentry_update(route_map_event_t event,
 	} else if (event == RMAP_EVENT_PLIST_DELETED) {
 		route_map_del_plist_entries(afi, index, plist_name, pentry);
 
-		if (plist->count == 1) {
+		if (plist == NULL || plist->count == 1) {
 			if (afi == AFI_IP) {
 				if (!route_map_is_ipv6_pfx_list_rule_present(
 					    index))
@@ -2463,8 +2463,7 @@ static void route_map_pentry_process_dependency(struct hash_bucket *bucket,
 			continue;
 
 		for (match = match_list->head; match; match = match->next) {
-			if (strcmp(match->rule_str, pentry_dep->plist_name)
-			    == 0) {
+			if (rulecmp(match->rule_str, pentry_dep->plist_name) == 0) {
 				if (IS_RULE_IPv4_PREFIX_LIST(match->cmd->str)
 				    && family == AF_INET) {
 					route_map_pentry_update(

@@ -22,6 +22,10 @@ Tshark is only required if you enable any packet captures on test runs.
 
 Valgrind is only required if you enable valgrind on test runs.
 
+Using multipath values of 256 is recommended due to tests starting to utilize
+greater values of ecmp.  There are some tests that require 512 but they are
+not part of the regular run of CI.
+
 Installing Topotest Requirements
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -40,7 +44,7 @@ Installing Topotest Requirements
    python3 -m pip install wheel
    python3 -m pip install 'pytest>=8.3.2' 'pytest-asyncio>=0.24.0' 'pytest-xdist>=3.6.1'
    python3 -m pip install 'scapy>=2.4.5'
-   python3 -m pip install xmltodict
+   python3 -m pip install pyyaml xmltodict
    python3 -m pip install git+https://github.com/Exa-Networks/exabgp@0659057837cd6c6351579e9f0fa47e9fb7de7311
    useradd -d /var/run/exabgp/ -s /bin/false exabgp
 
@@ -141,6 +145,7 @@ If you prefer to manually build FRR, then use the following suggested config:
        --enable-group=frr \
        --enable-vty-group=frrvty \
        --enable-snmp \
+       --enable-multipath=256 \
        --with-pkg-extra-version=-my-manual-build
 
 And create ``frr`` user and ``frrvty`` group as follows:
@@ -152,6 +157,13 @@ And create ``frr`` user and ``frrvty`` group as follows:
    adduser --system --ingroup frr --home /var/run/frr/ \
       --gecos "FRRouting suite" --shell /bin/false frr
    usermod -G frrvty frr
+
+Finally copy the support bundle config file over into it's appropriate place:
+
+.. code:: shell
+
+   sudo cp tools/etc/frr/support_bundle_commands.conf /etc/frr/
+
 
 Executing Tests
 ---------------
@@ -580,6 +592,25 @@ Here's an example of launching ``vtysh`` on routers ``rt1`` and ``rt2``.
 .. code:: shell
 
    sudo -E pytest --vtysh=rt1,rt2 all-protocol-startup
+
+Ignoring Backtrace Detection
+""""""""""""""""""""""""""""
+
+By default, topotests automatically check for backtraces in daemon log files after
+each test execution. If backtraces are detected, the test will fail. However, in
+some scenarios you may want to disable this automatic backtrace detection.
+
+To disable backtrace detection during test execution, use the ``--ignore-backtraces``
+CLI option:
+
+.. code:: shell
+
+   sudo -E pytest --ignore-backtraces all-protocol-startup
+
+This option is useful when:
+- Running tests in environments where backtraces are expected or acceptable
+- Debugging specific issues where backtrace detection interferes with test execution
+- Running tests with known issues that produce backtraces but are not critical
 
 .. _debug_with_gdb:
 

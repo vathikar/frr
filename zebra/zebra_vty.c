@@ -108,16 +108,13 @@ static char re_status_output_char(const struct route_entry *re,
 				star_p = true;
 		}
 
-		if (zrouter.asic_offloaded &&
-		    CHECK_FLAG(re->status, ROUTE_ENTRY_QUEUED))
+		if (zrouter.zav.asic_offloaded && CHECK_FLAG(re->status, ROUTE_ENTRY_QUEUED))
 			return 'q';
 
-		if (zrouter.asic_offloaded
-		    && CHECK_FLAG(re->flags, ZEBRA_FLAG_TRAPPED))
+		if (zrouter.zav.asic_offloaded && CHECK_FLAG(re->flags, ZEBRA_FLAG_TRAPPED))
 			return 't';
 
-		if (zrouter.asic_offloaded
-		    && CHECK_FLAG(re->flags, ZEBRA_FLAG_OFFLOAD_FAILED))
+		if (zrouter.zav.asic_offloaded && CHECK_FLAG(re->flags, ZEBRA_FLAG_OFFLOAD_FAILED))
 			return 'o';
 
 		if (CHECK_FLAG(re->flags, ZEBRA_FLAG_OUTOFSYNC))
@@ -973,9 +970,6 @@ DEFPY (show_ip_nht,
 	struct zebra_vrf *zvrf;
 	bool resolve_via_default = false;
 
-	if (uj)
-		json = json_object_new_object();
-
 	if (vrf_all) {
 		struct vrf *vrf;
 
@@ -987,6 +981,7 @@ DEFPY (show_ip_nht,
 						: zvrf->zebra_rnh_ipv6_default_route;
 
 				if (uj) {
+					json = json_object_new_object();
 					json_vrf = json_object_new_object();
 					json_nexthop = json_object_new_object();
 					json_object_object_add(json,
@@ -1024,11 +1019,8 @@ DEFPY (show_ip_nht,
 	memset(&prefix, 0, sizeof(prefix));
 	if (addr) {
 		p = sockunion2hostprefix(addr, &prefix);
-		if (!p) {
-			if (uj)
-				json_object_free(json);
+		if (!p)
 			return CMD_WARNING;
-		}
 	}
 
 	zvrf = zebra_vrf_lookup_by_id(vrf_id);
@@ -1037,8 +1029,10 @@ DEFPY (show_ip_nht,
 				      : zvrf->zebra_rnh_ipv6_default_route;
 
 	if (uj) {
+		json = json_object_new_object();
 		json_vrf = json_object_new_object();
 		json_nexthop = json_object_new_object();
+
 		if (vrf_name)
 			json_object_object_add(json, vrf_name, json_vrf);
 		else
@@ -1464,7 +1458,7 @@ DEFPY(show_nexthop_group,
 
 	struct zebra_vrf *zvrf = NULL;
 	afi_t afi = AFI_UNSPEC;
-	int type = 0;
+	uint8_t type = 0;
 	bool uj = use_json(argc, argv);
 	json_object *json = NULL;
 	json_object *json_vrf = NULL;
@@ -1482,7 +1476,7 @@ DEFPY(show_nexthop_group,
 
 	if (type_str) {
 		type = proto_redistnum((afi ? afi : AFI_IP), type_str);
-		if (type < 0) {
+		if (type == ZEBRA_ROUTE_ERROR) {
 			/* assume zebra */
 			type = ZEBRA_ROUTE_NHG;
 		}
@@ -1660,7 +1654,7 @@ DEFPY (show_route,
 	safi_t safi = mrib ? SAFI_MULTICAST : SAFI_UNICAST;
 	bool first_vrf_json = true;
 	struct vrf *vrf;
-	int type = 0;
+	uint8_t type = 0;
 	struct zebra_vrf *zvrf;
 	struct route_show_ctx ctx = {
 		.multi = vrf_all || table_all,
@@ -1679,7 +1673,7 @@ DEFPY (show_route,
 	}
 	if (type_str) {
 		type = proto_redistnum(afi, type_str);
-		if (type < 0) {
+		if (type == ZEBRA_ROUTE_ERROR) {
 			vty_out(vty, "Unknown route type\n");
 			return CMD_WARNING;
 		}
@@ -3736,7 +3730,7 @@ static inline bool zebra_vty_v6_rr_semantics_used(void)
 	if (zebra_nhg_kernel_nexthops_enabled())
 		return true;
 
-	if (zrouter.v6_rr_semantics)
+	if (zrouter.zav.v6_rr_semantics)
 		return true;
 
 	return false;
@@ -3768,7 +3762,7 @@ DEFUN (show_zebra,
 
 	ttable_rowseps(table, 0, BOTTOM, true, '-');
 	ttable_add_row(table, "OS|%s(%s)", cmd_system_get(), cmd_release_get());
-	ttable_add_row(table, "ECMP Maximum|%d", zrouter.multipath_num);
+	ttable_add_row(table, "ECMP Maximum|%d", zrouter.zav.multipath_num);
 	ttable_add_row(table, "v4 Forwarding|%s", ipforward() ? "On" : "Off");
 	ttable_add_row(table, "v6 Forwarding|%s",
 		       ipforward_ipv6() ? "On" : "Off");
@@ -3778,6 +3772,8 @@ DEFUN (show_zebra,
 	ttable_add_row(table, "v6 Route Replace Semantics|%s",
 		       zebra_vty_v6_rr_semantics_used() ? "Replace"
 							: "Delete then Add");
+	ttable_add_row(table, "Nexthop weight is 16 bits|%s",
+		       zrouter.zav.nexthop_weight_is_16bit ? "Yes" : "No");
 
 #ifdef GNU_LINUX
 	if (!vrf_is_backend_netns())
@@ -3789,10 +3785,10 @@ DEFUN (show_zebra,
 #endif
 
 	ttable_add_row(table, "v6 with v4 nexthop|%s",
-		       zrouter.v6_with_v4_nexthop ? "Used" : "Unavaliable");
+		       zrouter.zav.v6_with_v4_nexthop ? "Used" : "Unavailable");
 
 	ttable_add_row(table, "ASIC offload|%s",
-		       zrouter.asic_offloaded ? "Used" : "Unavailable");
+		       zrouter.zav.asic_offloaded ? "Used" : "Unavailable");
 
 	/*
 	 * Do not display this unless someone is actually using it
@@ -3800,7 +3796,7 @@ DEFUN (show_zebra,
 	 * Why this distinction?  I think this is effectively dead code
 	 * and should not be exposed.  Maybe someone proves me wrong.
 	 */
-	if (zrouter.asic_notification_nexthop_control)
+	if (zrouter.zav.asic_notification_nexthop_control)
 		ttable_add_row(table, "ASIC offload and nexthop control|Used");
 
 	ttable_add_row(table, "RA|%s",
@@ -3811,7 +3807,7 @@ DEFUN (show_zebra,
 			       : "BGP is not using");
 
 	ttable_add_row(table, "Kernel NHG|%s",
-		       zrouter.supports_nhgs ? "Available" : "Unavailable");
+		       zrouter.zav.supports_nhgs ? "Available" : "Unavailable");
 
 	ttable_add_row(table, "Allow Non FRR route deletion|%s",
 		       zrouter.allow_delete ? "Yes" : "No");
@@ -3832,6 +3828,8 @@ DEFUN (show_zebra,
 		       zrouter.all_mc_forwardingv6 ? "On" : "Off");
 	ttable_add_row(table, "v6 Default MC Forwarding|%s",
 		       zrouter.default_mc_forwardingv6 ? "On" : "Off");
+	ttable_add_row(table, "Backup Nexthops Installed|%s",
+		       zrouter.backup_nhs_installed ? "Yes" : "No");
 
 	out = ttable_dump(table, "\n");
 	vty_out(vty, "%s\n", out);

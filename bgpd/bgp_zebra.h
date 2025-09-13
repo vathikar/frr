@@ -22,6 +22,16 @@ extern struct zclient *bgp_zclient;
 /* Default weight for next hop, if doing weighted ECMP. */
 #define BGP_ZEBRA_DEFAULT_NHOP_WEIGHT 1
 
+/*
+ * Check if the path is eligible for annoucing to zebra.
+ */
+static inline bool bgp_zebra_announce_eligible(struct bgp_path_info *pi)
+{
+	return (pi->type == ZEBRA_ROUTE_BGP) &&
+	       ((pi->sub_type == BGP_ROUTE_NORMAL) || (pi->sub_type == BGP_ROUTE_AGGREGATE) ||
+		(pi->sub_type == BGP_ROUTE_IMPORTED));
+}
+
 extern void bgp_zebra_init(struct event_loop *master, unsigned short instance);
 extern void bgp_if_init(void);
 extern void bgp_zebra_init_tm_connect(struct bgp *bgp);
@@ -91,8 +101,7 @@ extern int bgp_zebra_advertise_svi_macip(struct bgp *bgp, int advertise,
 					 vni_t vni);
 extern int bgp_zebra_advertise_all_vni(struct bgp *bgp, int advertise);
 extern int bgp_zebra_dup_addr_detection(struct bgp *bgp);
-extern int bgp_zebra_vxlan_flood_control(struct bgp *bgp,
-					 enum vxlan_flood_control flood_ctrl);
+extern int bgp_zebra_vxlan_flood_control(struct bgp *bgp, struct bgpevpn *evpn);
 
 extern int bgp_zebra_num_connects(void);
 
@@ -129,7 +138,7 @@ extern bool bgp_zebra_request_srv6_sid(const struct srv6_sid_ctx *ctx,
 				       struct in6_addr *sid_value,
 				       const char *locator_name,
 				       uint32_t *sid_func);
-extern void bgp_zebra_release_srv6_sid(const struct srv6_sid_ctx *ctx);
+extern void bgp_zebra_release_srv6_sid(const struct srv6_sid_ctx *ctx, const char *locator_name);
 
 extern void bgp_zebra_send_nexthop_label(int cmd, mpls_label_t label,
 					 ifindex_t index, vrf_id_t vrfid,
@@ -143,5 +152,4 @@ extern enum zclient_send_status
 bgp_zebra_withdraw_actual(struct bgp_dest *dest, struct bgp_path_info *info,
 			  struct bgp *bgp);
 extern void bgp_zebra_process_remote_routes_for_l2vni(struct event *e);
-extern void bgp_zebra_process_remote_routes_for_l3vrf(struct event *e);
 #endif /* _QUAGGA_BGP_ZEBRA_H */

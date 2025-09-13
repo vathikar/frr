@@ -127,7 +127,7 @@ static struct ospf6_vertex *ospf6_vertex_create(struct ospf6_lsa *lsa)
 
 
 	/* Associated LSA */
-	v->lsa = lsa;
+	v->lsa = ospf6_lsa_lock(lsa);
 
 	/* capability bits + options */
 	v->capability = *(uint8_t *)(ospf6_lsa_header_end(lsa->header));
@@ -150,6 +150,7 @@ static void ospf6_vertex_delete(struct ospf6_vertex *v)
 {
 	list_delete(&v->nh_list);
 	list_delete(&v->child_list);
+	ospf6_lsa_unlock(&v->lsa);
 	XFREE(MTYPE_OSPF6_VERTEX, v);
 }
 
@@ -746,11 +747,7 @@ void ospf6_spf_display_subtree(struct vty *vty, const char *prefix, int rest,
 	}
 
 	len = strlen(prefix) + 4;
-	next_prefix = (char *)malloc(len);
-	if (next_prefix == NULL) {
-		vty_out(vty, "malloc failed\n");
-		return;
-	}
+	next_prefix = XMALLOC(MTYPE_TMP, len);
 	snprintf(next_prefix, len, "%s%s", prefix, (rest ? "|  " : "   "));
 
 	restnum = listcount(v->child_list);
@@ -776,7 +773,7 @@ void ospf6_spf_display_subtree(struct vty *vty, const char *prefix, int rest,
 		else
 			json_object_free(json_childs);
 	}
-	free(next_prefix);
+	XFREE(MTYPE_TMP, next_prefix);
 }
 
 DEFUN (debug_ospf6_spf_process,
