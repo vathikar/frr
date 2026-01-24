@@ -343,6 +343,26 @@ const struct frr_yang_module_info frr_pim_info = {
 			}
 		},
 		{
+			.xpath = "/frr-interface:lib/interface/frr-pim:pim/address-family/join-prune-interval",
+			.cbs = {
+				.modify = lib_interface_pim_address_family_join_prune_interval_modify,
+				.destroy = lib_interface_pim_address_family_join_prune_interval_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-interface:lib/interface/frr-pim:pim/address-family/assert-interval",
+			.cbs = {
+				.modify = lib_interface_pim_assert_interval_modify,
+			}
+		},
+		{
+			.xpath = "/frr-interface:lib/interface/frr-pim:pim/address-family/assert-override-interval",
+			.cbs = {
+				.modify = lib_interface_pim_assert_override_interval_modify,
+				.destroy = lib_interface_pim_assert_override_interval_destroy,
+			}
+		},
+		{
 			.xpath = "/frr-interface:lib/interface/frr-pim:pim/address-family/bfd",
 			.cbs = {
 				.create = lib_interface_pim_address_family_bfd_create,
@@ -418,13 +438,13 @@ const struct frr_yang_module_info frr_pim_info = {
 			.xpath = "/frr-interface:lib/interface/frr-pim:pim/address-family/mroute",
 			.cbs = {
 				.create = lib_interface_pim_address_family_mroute_create,
-				.destroy = lib_interface_pim_address_family_mroute_destroy,
+				.destroy = lib_interface_pim_address_family_mroute_oif_destroy,
 			}
 		},
 		{
 			.xpath = "/frr-interface:lib/interface/frr-pim:pim/address-family/mroute/oif",
 			.cbs = {
-				.modify = lib_interface_pim_address_family_mroute_oif_modify,
+				.create = lib_interface_pim_address_family_mroute_oif_create,
 				.destroy = lib_interface_pim_address_family_mroute_oif_destroy,
 			}
 		},
@@ -841,6 +861,13 @@ const struct frr_yang_module_info frr_gmp_info = {
 			.cbs = {
 				.modify = lib_interface_gm_rmap_modify,
 				.destroy = lib_interface_gm_rmap_destroy,
+			}
+		},
+		{
+			.xpath = "/frr-interface:lib/interface/frr-gmp:gmp/address-family/access-list",
+			.cbs = {
+				.modify = lib_interface_gm_alist_modify,
+				.destroy = lib_interface_gm_alist_destroy,
 			}
 		},
 		{

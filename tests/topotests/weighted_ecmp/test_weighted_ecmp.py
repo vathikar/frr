@@ -120,17 +120,17 @@ def test_weighted_ecmp():
         if weighted_group["nexthopCount"] != 4:
             return "Expected 4 nexthops, got {}".format(weighted_group["nexthopCount"])
 
-        if not weighted_group["valid"]:
+        if not weighted_group.get("valid", False):
             return "Nexthop group is not valid"
 
-        if not weighted_group["installed"]:
+        if not weighted_group.get("installed", False):
             return "Nexthop group is not installed"
 
         # Check that all expected nexthops are present with correct weights
         nexthops = weighted_group["nexthops"]
         expected_nexthops = {
             "10.0.1.2": {"interface": "r1-eth0", "weight": 3985},
-            "10.0.2.2": {"interface": "r1-eth1", "weight": 65534},
+            "10.0.2.2": {"interface": "r1-eth1", "weight": 65535},
             "10.0.1.3": {"interface": "r1-eth0", "weight": 8},
             "10.0.2.3": {"interface": "r1-eth1", "weight": 29335},
         }

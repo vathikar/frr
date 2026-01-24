@@ -69,6 +69,7 @@ PIMv6 Router
    by the prefix-list.
 
 .. clicmd:: rp keep-alive-timer (1-65535)
+   :daemon: pimv6
 
    Modify the time out value for a S,G flow from 1-65535 seconds at RP.
    The normal keepalive period for the KAT(S,G) defaults to 210 seconds.
@@ -137,6 +138,7 @@ PIMv6 Router
    Restrict the maximum amount of embedded RPs to learn at same time.
 
 .. clicmd:: spt-switchover infinity-and-beyond [prefix-list PLIST]
+   :daemon: pimv6
 
    On the last hop router if it is desired to not switch over to the SPT tree
    configure this command. Optional parameter prefix-list can be use to control
@@ -147,6 +149,7 @@ PIMv6 Router
    router pim6 block.
 
 .. clicmd:: join-prune-interval (1-65535)
+   :daemon: pimv6
 
    Modify the join/prune interval that pim uses to the new value. Time is
    specified in seconds. This command is vrf aware, to configure for a vrf,
@@ -154,7 +157,18 @@ PIMv6 Router
    a value smaller than 60 seconds be aware that this can and will affect
    convergence at scale.
 
+.. clicmd:: ip pim assert-interval (1000-86400000)
+
+   Modify the PIM assert interval in milliseconds on this interface
+   (defaults to 18000).
+
+.. clicmd:: ip pim assert-override-interval (1000-86400000)
+
+   Modify the PIM assert override interval in milliseconds on this
+   interface (defaults to 3000).
+
 .. clicmd:: keep-alive-timer (1-65535)
+   :daemon: pimv6
 
    Modify the time out value for a S,G flow from 1-65535 seconds. If choosing
    a value below 31 seconds be aware that some hardware platforms cannot see data
@@ -162,6 +176,7 @@ PIMv6 Router
    configure for a vrf, specify the vrf in the router pim6 block.
 
 .. clicmd:: packets (1-255)
+   :daemon: pimv6
 
    When processing packets from a neighbor process the number of packets
    incoming at one time before moving on to the next task. The default value is
@@ -170,12 +185,14 @@ PIMv6 Router
    configure for a vrf, specify the vrf in the router pim6 block.
 
 .. clicmd:: register-suppress-time (1-65535)
+   :daemon: pimv6
 
    Modify the time that pim will register suppress a FHR will send register
    notifications to the kernel. This command is vrf aware, to configure for a
    vrf, specify the vrf in the router pim6 block.
 
 .. clicmd:: ssm prefix-list WORD
+   :daemon: pimv6
 
    Specify a range of group addresses via a prefix-list that forces pim to
    never do SM over. This command is vrf aware, to configure for a vrf, specify
@@ -253,7 +270,8 @@ is in a vrf, enter the interface command with the vrf keyword at the end.
 
 .. clicmd:: ipv6 mld require-router-alert
 
-   Only accept MLD reports with the router-alert IPv6 hop option.
+   Only accept MLD reports with the router-alert IPv6 hop option. MLDv1 reports
+   without this option are always dropped and not controlled by this command.
 
 .. clicmd:: ipv6 mld join X:X::X:X [Y:Y::Y:Y]
 
@@ -301,9 +319,13 @@ is in a vrf, enter the interface command with the vrf keyword at the end.
    10 deciseconds. 'no' form of this command is used to to configure back to the
    default value.
 
+.. clicmd:: ipv6 mld access-list ACCESSLIST6_NAME
+
+   Apply the indicated access list to filter incoming MLD joins.
+
 .. clicmd:: ipv6 mld route-map ROUTE-MAP
 
-   Apply the indicated route map to filter incoming IGMP joins.
+   Apply the indicated route map to filter incoming MLD joins.
 
    The following match statements can be used:
 

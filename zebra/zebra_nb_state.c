@@ -89,6 +89,15 @@ lib_interface_zebra_state_zif_type_get_elem(struct nb_cb_get_elem_args *args)
 	case ZEBRA_IF_GRE:
 		type = "frr-zebra:zif-gre";
 		break;
+	case ZEBRA_IF_IP6GRE:
+		type = "frr-zebra:zif-ip6gre";
+		break;
+	case ZEBRA_IF_GRETAP:
+		type = "frr-zebra:zif-gretap";
+		break;
+	case ZEBRA_IF_IP6GRETAP:
+		type = "frr-zebra:zif-ip6gretap";
+		break;
 	case ZEBRA_IF_DUMMY:
 		type = "frr-zebra:zif-dummy";
 		break;
@@ -167,7 +176,12 @@ lib_interface_zebra_state_remote_vtep_get_elem(struct nb_cb_get_elem_args *args)
 	zebra_if = ifp->info;
 	vxlan_info = &zebra_if->l2info.vxl;
 
-	return yang_data_new_ipv4(args->xpath, &vxlan_info->vtep_ip);
+	if (IS_IPADDR_V4(&vxlan_info->vtep_ip))
+		return yang_data_new_ipv4(args->xpath, &vxlan_info->vtep_ip.ipaddr_v4);
+	else if (IS_IPADDR_V6(&vxlan_info->vtep_ip))
+		return yang_data_new_ipv6(args->xpath, &vxlan_info->vtep_ip.ipaddr_v6);
+	else
+		return NULL;
 }
 
 /*
@@ -189,6 +203,10 @@ lib_interface_zebra_state_mcast_group_get_elem(struct nb_cb_get_elem_args *args)
 		return NULL;
 
 	vni = zebra_vxlan_if_vni_find(zebra_if, 0);
+
+	if (vni->mcast_grp.s_addr == INADDR_ANY)
+		return NULL;
+
 	return yang_data_new_ipv4(args->xpath, &vni->mcast_grp);
 }
 

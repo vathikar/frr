@@ -637,15 +637,15 @@ def test_zebra_ipv4_routingtable_with_ldp():
 
     router["r1"].vtysh_cmd("config \n mpls ldp \n addr ipv4 \n no int r1-eth0 \n end")
 
-    def show_route_without_ldp():
+    def show_route_with_label():
         output = json.loads(router["r1"].vtysh_cmd("show ip route json"))
-        expected = {"2.2.2.2/32": [{"nexthops": [{"ip": "10.0.1.2"}]}]}
+        expected = {"2.2.2.2/32": [{"nexthops": [{"labels": [3]}]}]}
         return topotest.json_cmp(output, expected)
 
     # Make sure no label in route
-    test_func = partial(show_route_without_ldp)
+    test_func = partial(show_route_with_label)
     _, result = topotest.run_and_expect(test_func, None, count=30, wait=0.5)
-    assert result is None, "r1: wrongly with label in route!\n{}".format(result)
+    assert result, "r1: wrongly with label in route!\n{}".format(result)
 
     # r1: with both target and link config, r2: with only targeted config
     router["r2"].vtysh_cmd("config \n mpls ldp \n addr ipv4 \n no int r2-eth0 \n end")
@@ -657,13 +657,8 @@ def test_zebra_ipv4_routingtable_with_ldp():
     )
     router["r1"].vtysh_cmd("config \n mpls ldp \n addr ipv4 \n int r1-eth0 \n end")
 
-    def show_route_with_ldp():
-        output = json.loads(router["r1"].vtysh_cmd("show ip route json"))
-        expected = {"2.2.2.2/32": [{"nexthops": [{"labels": [3]}]}]}
-        return topotest.json_cmp(output, expected)
-
     # Make sure with label in route
-    test_func = partial(show_route_with_ldp)
+    test_func = partial(show_route_with_label)
     _, result = topotest.run_and_expect(test_func, None, count=30, wait=0.5)
     assert result is None, "r1: wrongly without label with route!"
 
@@ -680,7 +675,7 @@ def test_zebra_ipv4_routingtable_with_ldp():
     sleep(5)
 
     # Make sure with label in route with their original state
-    test_func = partial(show_route_with_ldp)
+    test_func = partial(show_route_with_label)
     _, result = topotest.run_and_expect(test_func, None, count=30, wait=0.5)
     assert result is None, "r1: wrongly without label with route!"
 
@@ -774,67 +769,79 @@ def test_linux_mpls_routes():
     # Verify Linux Kernel MPLS routes
     print("\n\n** Verifying Linux Kernel MPLS routes")
     print("******************************************\n")
-    failures = 0
+
+    def check_mpls_routes(router_id):
+        """Check MPLS routes for a specific router"""
+        refTableFile = "%s/r%s/ip_mpls_route.ref" % (thisDir, router_id)
+        if not os.path.isfile(refTableFile):
+            return None  # No reference file, consider it passed
+
+        # Read expected result from file
+        expected = open(refTableFile).read().rstrip()
+        # Fix newlines (make them all the same)
+        expected = ("\n".join(expected.splitlines()) + "\n").splitlines(1)
+
+        # Actual output from router
+        actual = (
+            net["r%s" % router_id].cmd("ip -o -family mpls route 2> /dev/null").rstrip()
+        )
+
+        print("\nActual\n")
+        print(actual)
+        print("\n\n")
+        # Mask out label and protocol
+        actual = re.sub(r"[0-9][0-9] via inet ", "xx via inet ", actual)
+        actual = re.sub(r"[0-9][0-9] +proto", "xx  proto", actual)
+        actual = re.sub(r"[0-9][0-9] as to ", "xx as to ", actual)
+        actual = re.sub(r"[ ]+proto \w+", "  proto xx", actual)
+
+        # Sort nexthops
+        nexthop_sorted = []
+        for line in actual.splitlines():
+            tokens = re.split(r"\\\t", line.strip())
+            nexthop_sorted.append(
+                "{} {}".format(
+                    tokens[0].strip(),
+                    " ".join([token.strip() for token in sorted(tokens[1:])]),
+                ).strip()
+            )
+
+        # Sort lines and fixup differences between old and new iproute
+        actual = "\n".join(sorted(nexthop_sorted))
+        actual = re.sub(r"nexthop via", "nexthopvia", actual)
+        actual = re.sub(r" nexthop as to xx via inet ", " nexthopvia inet ", actual)
+        actual = re.sub(r" weight 1", "", actual)
+        actual = re.sub(r" [ ]+", " ", actual)
+
+        # put \n back at line ends
+        actual = ("\n".join(actual.splitlines()) + "\n").splitlines(1)
+
+        # Generate Diff
+        diff = topotest.get_textdiff(
+            actual,
+            expected,
+            title1="actual Linux Kernel MPLS route",
+            title2="expected Linux Kernel MPLS route",
+        )
+
+        # Return diff if there's a mismatch, None if it matches
+        return diff
+
+    # Check each router with run_and_expect for convergence
     for i in range(1, 5):
-        refTableFile = "%s/r%s/ip_mpls_route.ref" % (thisDir, i)
-        if os.path.isfile(refTableFile):
-            # Read expected result from file
-            expected = open(refTableFile).read().rstrip()
-            # Fix newlines (make them all the same)
-            expected = ("\n".join(expected.splitlines()) + "\n").splitlines(1)
+        test_func = partial(check_mpls_routes, i)
+        _, diff = topotest.run_and_expect(test_func, None, count=30, wait=1)
 
-            # Actual output from router
-            actual = (
-                net["r%s" % i].cmd("ip -o -family mpls route 2> /dev/null").rstrip()
+        if diff:
+            sys.stderr.write(
+                "r%s failed Linux Kernel MPLS route output Check:\n%s\n" % (i, diff)
             )
-
-            # Mask out label and protocol
-            actual = re.sub(r"[0-9][0-9] via inet ", "xx via inet ", actual)
-            actual = re.sub(r"[0-9][0-9] +proto", "xx  proto", actual)
-            actual = re.sub(r"[0-9][0-9] as to ", "xx as to ", actual)
-            actual = re.sub(r"[ ]+proto \w+", "  proto xx", actual)
-
-            # Sort nexthops
-            nexthop_sorted = []
-            for line in actual.splitlines():
-                tokens = re.split(r"\\\t", line.strip())
-                nexthop_sorted.append(
-                    "{} {}".format(
-                        tokens[0].strip(),
-                        " ".join([token.strip() for token in sorted(tokens[1:])]),
-                    ).strip()
-                )
-
-            # Sort lines and fixup differences between old and new iproute
-            actual = "\n".join(sorted(nexthop_sorted))
-            actual = re.sub(r"nexthop via", "nexthopvia", actual)
-            actual = re.sub(r" nexthop as to xx via inet ", " nexthopvia inet ", actual)
-            actual = re.sub(r" weight 1", "", actual)
-            actual = re.sub(r" [ ]+", " ", actual)
-
-            # put \n back at line ends
-            actual = ("\n".join(actual.splitlines()) + "\n").splitlines(1)
-
-            # Generate Diff
-            diff = topotest.get_textdiff(
-                actual,
-                expected,
-                title1="actual Linux Kernel MPLS route",
-                title2="expected Linux Kernel MPLS route",
+            assert False, "Linux Kernel MPLS route output for router r%s:\n%s" % (
+                i,
+                diff,
             )
-
-            # Empty string if it matches, otherwise diff contains unified diff
-            if diff:
-                sys.stderr.write(
-                    "r%s failed Linux Kernel MPLS route output Check:\n%s\n" % (i, diff)
-                )
-                failures += 1
-            else:
-                print("r%s ok" % i)
-
-            assert (
-                failures == 0
-            ), "Linux Kernel MPLS route output for router r%s:\n%s" % (i, diff)
+        else:
+            print("r%s ok" % i)
 
     # Make sure that all daemons are running
     for i in range(1, 5):

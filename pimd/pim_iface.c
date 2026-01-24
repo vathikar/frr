@@ -130,6 +130,9 @@ struct pim_interface *pim_if_new(struct interface *ifp, bool gm, bool pim,
 	pim_ifp->gm_last_member_query_count = GM_DEFAULT_ROBUSTNESS_VARIABLE;
 	pim_ifp->gm_group_limit = UINT32_MAX;
 	pim_ifp->gm_source_limit = UINT32_MAX;
+	pim_ifp->periodic_jp_sec = -1;
+	pim_ifp->assert_msec = PIM_ASSERT_TIME;
+	pim_ifp->assert_override_msec = -1;
 
 	/* BSM config on interface: true by default */
 	pim_ifp->bsm_enable = true;
@@ -956,7 +959,7 @@ static int pim_iface_next_vif_index(struct interface *ifp)
 }
 
 /*
-  pim_if_add_vif() uses ifindex as vif_index
+  pim_if_add_vif() uses ifindex as mroute_vif_index
 
   see also pim_if_find_vifindex_by_ifindex()
  */
@@ -1039,6 +1042,10 @@ int pim_if_del_vif(struct interface *ifp)
 			  ifp->ifindex);
 		return -1;
 	}
+
+	if (PIM_DEBUG_ZEBRA)
+		zlog_debug("%s: vif_index=%d  on interface %s ifindex=%d", __func__,
+			   pim_ifp->mroute_vif_index, ifp->name, ifp->ifindex);
 
 	/* if the device was a pim_vxlan iif/oif update vxlan mroute entries */
 	pim_vxlan_del_vif(ifp);
@@ -1144,6 +1151,19 @@ uint16_t pim_if_jp_override_interval_msec(struct interface *ifp)
 	       + pim_if_effective_override_interval_msec(ifp);
 }
 
+int pim_if_jp_period(const struct pim_interface *pim_interface)
+{
+	if (pim_interface->periodic_jp_sec != -1)
+		return pim_interface->periodic_jp_sec;
+
+	return router->t_periodic;
+}
+
+int pim_if_jp_hold(const struct pim_interface *pim_interface)
+{
+	return pim_if_jp_period(pim_interface) * 7 / 2;
+}
+
 /*
   RFC 4601: 4.1.6.  State Summarization Macros
 
@@ -1206,7 +1226,7 @@ long pim_if_t_suppressed_msec(struct interface *ifp)
 
 	/* t_suppressed = t_periodic * rand(1.1, 1.4) */
 	ramount = 1100 + (frr_weak_random() % (1400 - 1100 + 1));
-	t_suppressed_msec = router->t_periodic * ramount;
+	t_suppressed_msec = pim_if_jp_period(pim_ifp) * ramount;
 
 	return t_suppressed_msec;
 }
@@ -1716,6 +1736,7 @@ void pim_if_create_pimreg(struct pim_instance *pim)
 			snprintf(pimreg_name, sizeof(pimreg_name), PIMREG "%u",
 				 pim->vrf->data.l.table_id);
 
+		pim_reg_sock_bind(pim);
 		pim->regiface = if_get_by_name(pimreg_name, pim->vrf->vrf_id,
 					       pim->vrf->name);
 		pim->regiface->ifindex = PIM_OIF_PIM_REGISTER_VIF;
@@ -1886,6 +1907,13 @@ static int pim_ifp_up(struct interface *ifp)
 	  PIM
 	*/
 	pim_if_addr_add_all(ifp);
+
+	/*pimreg interface might not be created in pim_ifp_create as
+	 * operational state may  be down at that moment, create one now if
+	 * not created.
+	 */
+	if (if_is_operative(ifp) && (!pim->regiface))
+		pim_if_create_pimreg(pim);
 
 	/*
 	 * If we have a pimreg device callback and it's for a specific

@@ -311,6 +311,7 @@ union prefixconstptr {
 #endif /* INET_ADDRSTRLEN */
 
 #ifndef INET6_ADDRSTRLEN
+/* Use this for GUA or LL IPv6 address len */
 /* dead:beef:dead:beef:dead:beef:dead:beef + \0 */
 #define INET6_ADDRSTRLEN 46
 #endif /* INET6_ADDRSTRLEN */
@@ -320,7 +321,7 @@ union prefixconstptr {
 #endif /* INET6_BUFSIZ */
 
 /* Maximum string length of the result of prefix2str */
-#define PREFIX_STRLEN 80
+#define PREFIX_STRLEN 84
 
 /*
  * Longest possible length of a (S,G) string is 82 bytes
@@ -403,6 +404,8 @@ static inline afi_t prefix_afi(union prefixconstptr pu)
  *    which bit to fetch from byte buffer, 0 indexed.
  */
 extern unsigned int prefix_bit(const uint8_t *prefix, const uint16_t bit_index);
+
+extern void prefix_flowspec_ptr_free(struct prefix *p);
 
 extern struct prefix *prefix_new(void);
 extern void prefix_free(struct prefix **p);

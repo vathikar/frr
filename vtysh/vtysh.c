@@ -129,13 +129,13 @@ struct vtysh_client vtysh_client[] = {
 	{.name = "babeld", .flag = VTYSH_BABELD},
 	{.name = "sharpd", .flag = VTYSH_SHARPD},
 	{.name = "fabricd", .flag = VTYSH_FABRICD},
-	{.name = "watchfrr", .flag = VTYSH_WATCHFRR},
 	{.name = "pbrd", .flag = VTYSH_PBRD},
 	{.name = "staticd", .flag = VTYSH_STATICD},
 	{.name = "bfdd", .flag = VTYSH_BFDD},
 	{.name = "vrrpd", .flag = VTYSH_VRRPD},
 	{.name = "pathd", .flag = VTYSH_PATHD},
 	{.name = "pim6d", .flag = VTYSH_PIM6D},
+	{.name = "watchfrr", .flag = VTYSH_WATCHFRR},
 };
 
 /* Searches for client by name, returns index */
@@ -3432,6 +3432,52 @@ DEFUN (vtysh_show_memory,
 	return show_per_daemon(vty, argv, argc, "Memory statistics for %s:\n");
 }
 
+/*
+ * Support clis when using the tcmalloc lib
+ */
+#ifdef HAVE_TCMALLOC
+
+DEFUN (vtysh_show_tcmalloc_stats,
+       vtysh_show_tcmalloc_stats_cmd,
+       "show tcmalloc stats [" DAEMONS_LIST "]",
+       SHOW_STR
+       "tcmalloc library info\n"
+       "Show tcmalloc stats\n"
+       DAEMONS_STR)
+{
+	if (argc == 4)
+		return show_one_daemon(vty, argv, argc - 1, argv[argc - 1]->text);
+
+	return show_per_daemon(vty, argv, argc, "tcmalloc statistics for %s:\n");
+}
+
+DEFUN (vtysh_tcmalloc_config,
+       vtysh_tcmalloc_config_cmd,
+       "memory release rate (0-100)",
+       "memory library config\n"
+       "Release free memory to OS\n"
+       "Set mem release rate (zero to disable)\n"
+       "Set release rate (MB/sec)\n")
+{
+	unsigned int i;
+	int cmd_stat;
+	char *line;
+
+	line = argv_concat(argv, argc, 0);
+
+	for (i = 0; i < array_size(vtysh_client); i++) {
+		cmd_stat = vtysh_client_execute(&vtysh_client[i], line);
+		if (cmd_stat == CMD_WARNING)
+			break;
+	}
+
+	XFREE(MTYPE_TMP, line);
+
+	return CMD_SUCCESS;
+}
+
+#endif /* HAVE_TCMALLOC */
+
 DEFUN (vtysh_show_modules,
        vtysh_show_modules_cmd,
        "show modules",
@@ -3615,13 +3661,17 @@ DEFUN (vtysh_show_running_config,
 	return vtysh_write_terminal(self, vty, argc, argv);
 }
 
-static void show_route_map_send(const char *route_map, bool json)
+static void show_route_map_send(const char *route_map, bool unused, bool json)
 {
 	unsigned int i;
 	bool first = true;
 	char command_line[128];
 
-	snprintf(command_line, sizeof(command_line), "do show route-map ");
+	if (unused)
+		snprintf(command_line, sizeof(command_line), "do show route-map-unused ");
+	else
+		snprintf(command_line, sizeof(command_line), "do show route-map ");
+
 	if (route_map)
 		strlcat(command_line, route_map, sizeof(command_line));
 	if (json)
@@ -3667,7 +3717,19 @@ DEFPY (show_route_map,
        "route-map name\n"
        JSON_STR)
 {
-	show_route_map_send(route_map, !!json);
+	show_route_map_send(route_map, false, !!json);
+
+	return CMD_SUCCESS;
+}
+
+DEFPY (show_route_map_unused,
+       show_route_map_unused_cmd,
+       "show route-map-unused [json]$json",
+       SHOW_STR
+       "unused route-map information\n"
+       JSON_STR)
+{
+	show_route_map_send(NULL, true, !!json);
 
 	return CMD_SUCCESS;
 }
@@ -4335,6 +4397,8 @@ static void vtysh_log_print(struct vtysh_client *vclient,
 	struct visual_prio *vis;
 	struct tm tm;
 	char ts_buf[32];
+	char ts_frac[16] = "";
+	int ts_prec = hdr->ts_subsec;
 
 	if (hdr->prio >= array_size(visual_prios))
 		vis = &visual_prios[LOG_CRIT];
@@ -4343,20 +4407,27 @@ static void vtysh_log_print(struct vtysh_client *vclient,
 
 	localtime_r(&ts, &tm);
 	strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S", &tm);
+	if (ts_prec > 0) {
+		uint32_t frac = hdr->ts_nsec;
+
+		if (ts_prec > 9)
+			ts_prec = 9;
+		for (int i = ts_prec; i < 9; i++)
+			frac /= 10;
+		snprintf(ts_frac, sizeof(ts_frac), ".%0*u", ts_prec, frac);
+	}
 
 	if (!stderr_tty) {
 		const char *label = vis->label + strlen(vis->label) - 4;
 
-		fprintf(stderr, "%s.%03u [%s] %s: %.*s\n", ts_buf,
-			hdr->ts_nsec / 1000000U, label, vclient->name,
+		fprintf(stderr, "%s%s [%s] %s: %.*s\n", ts_buf, ts_frac, label, vclient->name,
 			(int)textlen, text);
 		return;
 	}
 
 	fprintf(stderr,
-		"\e[48;5;%dm\e[38;5;247m%s.%03u [%s\e[38;5;247m] \e[38;5;255m%s\e[38;5;247m: \e[38;5;251m",
-		vis->c256_background, ts_buf, hdr->ts_nsec / 1000000U,
-		vis->label, vclient->name);
+		"\e[48;5;%dm\e[38;5;247m%s%s [%s\e[38;5;247m] \e[38;5;255m%s\e[38;5;247m: \e[38;5;251m",
+		vis->c256_background, ts_buf, ts_frac, vis->label, vclient->name);
 
 	for (size_t fmtpos = 0; fmtpos < hdr->n_argpos; fmtpos++) {
 		struct fmt_outpos *fmt = &hdr->argpos[fmtpos];
@@ -4380,9 +4451,9 @@ static void vtysh_log_print(struct vtysh_client *vclient,
 		text + textpos);
 }
 
-static void vtysh_log_read(struct event *thread)
+static void vtysh_log_read(struct event *event)
 {
-	struct vtysh_client *vclient = EVENT_ARG(thread);
+	struct vtysh_client *vclient = EVENT_ARG(event);
 	struct {
 		struct zlog_live_hdr hdr;
 		char text[4096];
@@ -4430,6 +4501,7 @@ static void vtysh_log_read(struct event *thread)
 		buf.hdr.ts_nsec = ts.tv_nsec;
 		buf.hdr.prio = LOG_ERR;
 		buf.hdr.flags = 0;
+		buf.hdr.ts_subsec = 3;
 		buf.hdr.texthdrlen = 0;
 		buf.hdr.n_argpos = 0;
 	} else {
@@ -4729,6 +4801,20 @@ DEFUN(find,
 	return cmd_find_cmds(vty, argv, argc);
 }
 
+DEFUN(clear,
+      clear_cmd,
+      "clear",
+      "Clear the terminal\n")
+{
+	rl_clear_screen(0, 0);
+#ifdef __OpenBSD__
+	rl_refresh_line(0, 0);
+#else
+	rl_clear_visible_line();
+#endif
+	return CMD_SUCCESS;
+}
+
 DEFUN_HIDDEN(show_cli_graph_vtysh,
 	     show_cli_graph_vtysh_cmd,
 	     "show cli graph",
@@ -4748,6 +4834,7 @@ static void vtysh_install_default(enum node_type node)
 {
 	_install_element(node, &config_list_cmd);
 	_install_element(node, &find_cmd);
+	_install_element(node, &clear_cmd);
 	_install_element(node, &show_cli_graph_vtysh_cmd);
 	_install_element(node, &vtysh_output_file_cmd);
 	_install_element(node, &no_vtysh_output_file_cmd);
@@ -5612,6 +5699,7 @@ void vtysh_init_vty(void)
 	install_element(ENABLE_NODE, &vtysh_copy_to_running_cmd);
 
 	install_element(ENABLE_NODE, &show_route_map_cmd);
+	install_element(ENABLE_NODE, &show_route_map_unused_cmd);
 	install_element(ENABLE_NODE, &show_ip_prefix_list_cmd);
 	install_element(ENABLE_NODE, &show_ip_prefix_list_summary_cmd);
 	install_element(ENABLE_NODE, &show_ip_prefix_list_detail_cmd);
@@ -5681,6 +5769,12 @@ void vtysh_init_vty(void)
 	install_element(VIEW_NODE, &vtysh_show_event_cpu_cmd);
 	install_element(VIEW_NODE, &vtysh_show_event_poll_cmd);
 	install_element(VIEW_NODE, &vtysh_show_event_timer_cmd);
+
+	/* tcmalloc-specific commands */
+#ifdef HAVE_TCMALLOC
+	install_element(VIEW_NODE, &vtysh_show_tcmalloc_stats_cmd);
+	install_element(CONFIG_NODE, &vtysh_tcmalloc_config_cmd);
+#endif /* HAVE_TCMALLOC */
 
 	/* Logging */
 	install_element(VIEW_NODE, &vtysh_show_logging_cmd);

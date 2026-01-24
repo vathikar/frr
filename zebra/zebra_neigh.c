@@ -328,7 +328,8 @@ static void zebra_neigh_handle_5549(uint32_t ndm_family, uint32_t ndm_state, str
 }
 
 /* Is vni mcast group */
-static bool is_mac_vni_mcast_group(struct ethaddr *mac, vni_t vni, struct in_addr grp_addr)
+static bool is_mac_vni_mcast_group(struct ethaddr *mac, vni_t vni,
+				   const struct ipaddr *grp_addr)
 {
 	if (!vni)
 		return false;
@@ -336,10 +337,7 @@ static bool is_mac_vni_mcast_group(struct ethaddr *mac, vni_t vni, struct in_add
 	if (!is_zero_mac(mac))
 		return false;
 
-	if (!IN_MULTICAST(ntohl(grp_addr.s_addr)))
-		return false;
-
-	return true;
+	return ipaddr_is_mcast(grp_addr);
 }
 
 static int zebra_nbr_entry_state_to_zclient(int nbr_state)
@@ -379,7 +377,7 @@ static void zebra_neigh_ipaddr_update(struct zebra_dplane_ctx *ctx)
 	union sockunion link_layer_ipv4;
 	struct interface *link_if;
 	struct ethaddr mac;
-	bool is_ext;
+	bool is_own;
 	bool is_router;
 	bool local_inactive;
 	bool dp_static;
@@ -460,7 +458,7 @@ static void zebra_neigh_ipaddr_update(struct zebra_dplane_ctx *ctx)
 
 	if (op == DPLANE_OP_NEIGH_IP_INSTALL) {
 		mac = *dplane_ctx_neigh_get_mac(ctx);
-		is_ext = dplane_ctx_neigh_get_is_ext(ctx);
+		is_own = dplane_ctx_neigh_get_is_own(ctx);
 		is_router = dplane_ctx_neigh_get_is_router(ctx);
 		local_inactive = dplane_ctx_neigh_get_local_inactive(ctx);
 		dp_static = dplane_ctx_neigh_get_dp_static(ctx);
@@ -473,14 +471,14 @@ static void zebra_neigh_ipaddr_update(struct zebra_dplane_ctx *ctx)
 		 */
 		if (ndm_state & ZEBRA_NUD_VALID) {
 			/* Add local neighbors to the l3 interface database */
-			if (is_ext)
+			if (is_own)
 				zebra_neigh_del(ifp, &ip);
 			else
 				zebra_neigh_add(ifp, &ip, &mac);
 
 			if (link_if)
 				zebra_vxlan_handle_kernel_neigh_update(ifp, link_if, &ip, &mac,
-								       ndm_state, is_ext, is_router,
+								       ndm_state, is_own, is_router,
 								       local_inactive, dp_static);
 			return;
 		}
@@ -516,7 +514,7 @@ static void zebra_neigh_macfdb_update(struct zebra_dplane_ctx *ctx)
 	ifindex_t vni;
 	struct zebra_vxlan_vni *vnip;
 	struct ethaddr mac;
-	struct in_addr vtep_ip;
+	const struct ipaddr *vtep_ip;
 	bool sticky;
 	bool local_inactive;
 	bool dp_static;
@@ -563,7 +561,7 @@ static void zebra_neigh_macfdb_update(struct zebra_dplane_ctx *ctx)
 	}
 
 	mac = *dplane_ctx_mac_get_addr(ctx);
-	vtep_ip = *dplane_ctx_mac_get_vtep_ip(ctx);
+	vtep_ip = dplane_ctx_mac_get_vtep_ip(ctx);
 
 	/* Check if this is a mcast group update (svd case) */
 	vni_mcast_grp = is_mac_vni_mcast_group(&mac, vni, vtep_ip);
@@ -585,17 +583,40 @@ static void zebra_neigh_macfdb_update(struct zebra_dplane_ctx *ctx)
 	if (op == DPLANE_OP_NEIGH_INSTALL) {
 		/* Drop "permanent" entries. */
 		if (!vni_mcast_grp && (ndm_state & ZEBRA_NUD_PERMANENT)) {
+			/*
+			 * If zebra started gracefully and if this is a HREP
+			 * entry, then restore it.
+			 */
+			if (zrouter.graceful_restart && is_zero_mac(&mac))
+				zebra_vxlan_stale_hrep_add(*vtep_ip, vni);
+
 			if (IS_ZEBRA_DEBUG_KERNEL)
 				zlog_debug("        Dropping entry because of ZEBRA_NUD_PERMANENT");
 			return;
 		}
+
+		/*
+		 * If zebra started gracefully and if this is a remote MAC/RMAC
+		 * entry, then restore it.
+		 */
+		if (zrouter.graceful_restart && CHECK_FLAG(ndm_flags, ZEBRA_NTF_EXT_LEARNED))
+			zebra_vxlan_stale_remote_mac_add(&mac, *vtep_ip, sticky, vni);
+
 
 		if (IS_ZEBRA_IF_VXLAN(ifp)) {
 			if (!dst_present)
 				return;
 
 			if (vni_mcast_grp) {
-				zebra_vxlan_if_vni_mcast_group_add_update(ifp, vni, &vtep_ip);
+				if (IS_IPADDR_V4(vtep_ip)) {
+					zebra_vxlan_if_vni_mcast_group_add_update(ifp, vni,
+						  (struct in_addr *)&vtep_ip->ipaddr_v4.s_addr);
+					/* IPV6 mcast is not supported with EVPNv6 */
+				} else if (IS_IPADDR_V6(vtep_ip)) {
+					if (IS_ZEBRA_DEBUG_KERNEL)
+						zlog_debug("%s ifp %s vni %u IPv6 address %pIA is not supported",
+							   __func__, ifp->name, vni, vtep_ip);
+				}
 				return;
 			}
 
@@ -624,12 +645,20 @@ static void zebra_neigh_macfdb_update(struct zebra_dplane_ctx *ctx)
 
 	if (dst_present) {
 		if (vni_mcast_grp) {
-			zebra_vxlan_if_vni_mcast_group_del(ifp, vni, &vtep_ip);
+			if (IS_IPADDR_V4(vtep_ip)) {
+				zebra_vxlan_if_vni_mcast_group_del(ifp, vni,
+					  (struct in_addr *)&vtep_ip->ipaddr_v4.s_addr);
+				/* IPV6 mcast is not supported with EVPNv6 */
+			} else if (IS_IPADDR_V6(vtep_ip)) {
+				if (IS_ZEBRA_DEBUG_KERNEL)
+					zlog_debug("%s ifp %s vni %u IPv6 address %pIA is not supported",
+						   __func__, ifp->name, vni, vtep_ip);
+			}
 			return;
 		}
 
 		if (is_zero_mac(&mac) && vni) {
-			zebra_vxlan_check_readd_vtep(ifp, vni, vtep_ip);
+			zebra_vxlan_check_readd_vtep(ifp, vni, (struct ipaddr *)vtep_ip);
 			return;
 		}
 		return;

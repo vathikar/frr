@@ -346,9 +346,9 @@ static enum zclient_send_status zclient_failed(struct zclient *zclient)
 	return ZCLIENT_SEND_FAILURE;
 }
 
-static void zclient_flush_data(struct event *thread)
+static void zclient_flush_data(struct event *event)
 {
-	struct zclient *zclient = EVENT_ARG(thread);
+	struct zclient *zclient = EVENT_ARG(event);
 
 	zclient->t_write = NULL;
 	if (zclient->sock < 0)
@@ -2347,7 +2347,7 @@ bool zapi_srv6_sid_notify_decode(struct stream *s, struct srv6_sid_ctx *ctx,
 {
 	uint32_t f, wf;
 	uint16_t len;
-	static char locator_name[SRV6_LOCNAME_SIZE] = {};
+	static char locator_name[SRV6_LOCNAME_SIZE];
 
 	STREAM_GET(note, s, sizeof(*note));
 	STREAM_GET(ctx, s, sizeof(struct srv6_sid_ctx));
@@ -2369,6 +2369,7 @@ bool zapi_srv6_sid_notify_decode(struct stream *s, struct srv6_sid_ctx *ctx,
 		if (len == 0)
 			*p_locator_name = NULL;
 		else {
+			memset(locator_name, 0, sizeof(locator_name));
 			STREAM_GET(locator_name, s, len);
 			*p_locator_name = locator_name;
 		}
@@ -3068,6 +3069,7 @@ static void zebra_interface_if_set_value(struct stream *s,
 	STREAM_GETL(s, ifp->mtu6);
 	STREAM_GETL(s, ifp->bandwidth);
 	STREAM_GETL(s, ifp->link_ifindex);
+	STREAM_GETL(s, ifp->zif_type);
 	STREAM_GETL(s, ifp->ll_type);
 	STREAM_GETL(s, ifp->hw_addr_len);
 	if (ifp->hw_addr_len)
@@ -4429,18 +4431,12 @@ static int zclient_capability_decode(ZAPI_CALLBACK_ARGS)
 {
 	struct zclient_capabilities cap;
 	struct stream *s = zclient->ibuf;
-	int vrf_backend;
+	enum vrf_backend_type vrf_backend;
 	uint8_t mpls_enabled;
 
-	STREAM_GETL(s, vrf_backend);
+	STREAM_GETC(s, vrf_backend);
 
-	if (vrf_backend < 0 || vrf_configure_backend(vrf_backend)) {
-		flog_err(EC_LIB_ZAPI_ENCODE,
-			 "%s: Garbage VRF backend type: %d", __func__,
-			 vrf_backend);
-		goto stream_failure;
-	}
-
+	vrf_configure_backend(vrf_backend);
 
 	memset(&cap, 0, sizeof(cap));
 	STREAM_GETC(s, mpls_enabled);
@@ -4765,7 +4761,7 @@ static zclient_handler *const lib_handlers[] = {
 };
 
 /* Zebra client message read function. */
-static void zclient_read(struct event *thread)
+static void zclient_read(struct event *event)
 {
 	size_t already;
 	uint16_t length, command;
@@ -4774,7 +4770,7 @@ static void zclient_read(struct event *thread)
 	struct zclient *zclient;
 
 	/* Get socket to zebra. */
-	zclient = EVENT_ARG(thread);
+	zclient = EVENT_ARG(event);
 	zclient->t_read = NULL;
 
 	/* Read zebra header (if we don't have it already). */
@@ -4877,7 +4873,7 @@ static void zclient_read(struct event *thread)
 		/* Connection was closed during packet processing. */
 		return;
 
-	/* Register read thread. */
+	/* Register read event. */
 	stream_reset(zclient->ibuf);
 	zclient_event(ZCLIENT_READ, zclient);
 }
@@ -5419,6 +5415,26 @@ void zclient_register_neigh(struct zclient *zclient, vrf_id_t vrf_id, afi_t afi,
 				  : ZEBRA_NEIGH_UNREGISTER,
 			      vrf_id);
 	stream_putw(s, afi);
+	stream_putw_at(s, 0, stream_get_endp(s));
+	zclient_send_message(zclient);
+}
+
+void zclient_neigh_get(struct zclient *zclient, struct interface *ifp, afi_t afi)
+{
+	struct stream *s;
+
+	if (!zclient || zclient->sock < 0) {
+		zlog_err("%s : zclient not connected", __func__);
+		return;
+	}
+
+	s = zclient->obuf;
+	stream_reset(s);
+
+	zclient_create_header(s, ZEBRA_NEIGH_GET, VRF_DEFAULT);
+	stream_putl(s, ifp->ifindex);
+	stream_putw(s, afi);
+
 	stream_putw_at(s, 0, stream_get_endp(s));
 	zclient_send_message(zclient);
 }
