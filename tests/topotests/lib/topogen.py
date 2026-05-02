@@ -576,6 +576,36 @@ class Topogen(object):
             return True
         return False
 
+    def log_test_start(self, test_path):
+        "Log the start of a test"
+        for router in self.routers().values():
+            try:
+                router.net.cmd_nostatus(
+                    f"vtysh -c 'send log level info === TEST-START: {shlex.quote(test_path)}'"
+                )
+            except Exception:
+                pass
+
+    def log_test_result(self, test_path, result):
+        "Log the result of a test"
+        for router in self.routers().values():
+            try:
+                router.net.cmd_nostatus(
+                    f"vtysh -c 'send log level info === TEST-RESULT: {result}: {shlex.quote(test_path)}'"
+                )
+            except Exception:
+                pass
+
+    def log_test_end(self, test_path):
+        "Log the end of a test"
+        for router in self.routers().values():
+            try:
+                router.net.cmd_nostatus(
+                    f"vtysh -c 'send log level info === TEST-END: {shlex.quote(test_path)}'"
+                )
+            except Exception:
+                pass
+
 
 #
 # Topology gears (equipment)
@@ -802,6 +832,7 @@ class TopoRouter(TopoGear):
         logfile = self._setup_tmpdir()
         params["logdir"] = self.logdir
 
+        self.daemondir = params.get("frrdir")
         self.logger = topolog.get_logger(name, log_level="debug", target=logfile)
         params["logger"] = self.logger
         tgen.net.add_host(self.name, cls=cls, **params)
@@ -1022,7 +1053,7 @@ class TopoRouter(TopoGear):
         self.logger.debug("Killing daemons using SIGKILL..")
         return self.net.killRouterDaemons(daemons, wait, assertOnError)
 
-    def vtysh_cmd(self, command, isjson=False, daemon=None):
+    def vtysh_cmd(self, command, isjson=False, daemon=None, raises=False):
         """
         Runs the provided command string in the vty shell and returns a string
         with the response.
@@ -1032,7 +1063,7 @@ class TopoRouter(TopoGear):
         """
         # Detect multi line commands
         if command.find("\n") != -1:
-            return self.vtysh_multicmd(command, daemon=daemon)
+            return self.vtysh_multicmd(command, daemon=daemon, raises=raises)
 
         dparam = ""
         if daemon is not None:
@@ -1043,7 +1074,10 @@ class TopoRouter(TopoGear):
         )
 
         self.logger.debug("vtysh command => {}".format(shlex.quote(command)))
-        output = self.run(vtysh_command)
+        if raises:
+            output = self.cmd_raises(vtysh_command)
+        else:
+            output = self.run(vtysh_command)
 
         dbgout = output.strip()
         if dbgout:
@@ -1067,7 +1101,7 @@ class TopoRouter(TopoGear):
             )
             return {}
 
-    def vtysh_multicmd(self, commands, pretty_output=True, daemon=None):
+    def vtysh_multicmd(self, commands, pretty_output=True, daemon=None, raises=False):
         """
         Runs the provided commands in the vty shell and return the result of
         execution.
@@ -1093,7 +1127,11 @@ class TopoRouter(TopoGear):
         dbgcmds = "\t" + dbgcmds.replace("\n", "\n\t")
         self.logger.debug("vtysh command => FILE:\n{}".format(dbgcmds))
 
-        res = self.run(vtysh_command)
+        if raises:
+            res = self.cmd_raises(vtysh_command)
+        else:
+            res = self.run(vtysh_command)
+
         os.unlink(fname)
 
         dbgres = res.strip()

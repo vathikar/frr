@@ -234,7 +234,7 @@ void if_update_state_mtu6(struct interface *ifp, uint mtu)
 		return;
 	ifp->mtu6 = mtu;
 	if (ifp->state && if_notify_oper_changes)
-		nb_op_updatef(ifp->state, "mtu6", "%u", ifp->mtu);
+		nb_op_updatef(ifp->state, "mtu6", "%u", ifp->mtu6);
 }
 
 void if_update_state_hw_addr(struct interface *ifp, const uint8_t *hw_addr, uint len)
@@ -972,6 +972,18 @@ struct nbr_connected *nbr_connected_check(struct interface *ifp,
 	return NULL;
 }
 
+/* Return true if there is at least one connected address in the given family  */
+bool if_has_connected_with_family(struct interface *ifp, int family)
+{
+	struct connected *connected;
+
+	frr_each (if_connected, ifp->connected, connected)
+		if (connected->address->family == family)
+			return true;
+
+	return false;
+}
+
 /* count the number of connected addresses that are in the given family */
 unsigned int connected_count_by_family(struct interface *ifp, int family)
 {
@@ -1363,7 +1375,7 @@ DEFPY_YANG (no_interface,
 
 static void netns_ifname_split(const char *xpath, char *ifname, char *vrfname)
 {
-	char *delim;
+	const char *delim;
 	int len;
 
 	assert(vrf_is_backend_netns());
@@ -1745,8 +1757,7 @@ static enum nb_error lib_interface_vrf_get(const struct nb_node *nb_node, const 
 	const struct lysc_node *snode = nb_node->snode;
 	const struct interface *ifp = list_entry;
 
-	if (lyd_new_term(parent, snode->module, snode->name, ifp->vrf->name, LYD_NEW_PATH_UPDATE,
-			 NULL))
+	if (lyd_new_term(parent, snode->module, snode->name, ifp->vrf->name, false, NULL))
 		return NB_ERR_RESOURCE;
 	return NB_OK;
 }

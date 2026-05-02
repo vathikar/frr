@@ -436,7 +436,7 @@ int rfapi_rib_key_cmp(const void *k1, const void *k2)
  * that are not strictly needed.
  *
  * This function could be modified to compare option chains more
- * thoroughly, but it's not clear that the extra compuation would
+ * thoroughly, but it's not clear that the extra computaion would
  * be worth it.
  */
 static int bgp_tea_options_cmp(struct bgp_tea_options *a,
@@ -668,11 +668,20 @@ static void rfapiRibBi2Ri(struct bgp_path_info *bpi, struct rfapi_info *ri,
 			break;
 
 		case BGP_VNC_SUBTLV_TYPE_RFPOPTION:
+			/* Check for short subtlv: drop */
+			if (pEncap->length < 3)
+				break;
+
+			/* Length of zero not valid */
+			if (pEncap->value[1] == 0)
+				break;
+
 			hop = XCALLOC(MTYPE_BGP_TEA_OPTIONS,
 				      sizeof(struct bgp_tea_options));
 			assert(hop);
 			hop->type = pEncap->value[0];
 			hop->length = pEncap->value[1];
+
 			hop->value = XCALLOC(MTYPE_BGP_TEA_OPTIONS_VALUE,
 					     pEncap->length - 2);
 			assert(hop->value);

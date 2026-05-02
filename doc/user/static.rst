@@ -14,8 +14,8 @@ Starting STATIC
 
 .. program:: staticd
 
-:abbr:`STATIC` supports all the common FRR daemon start options which are
-documented elsewhere.
+:abbr:`STATIC` supports all the common FRR daemon start options
+(:ref:`common-invocation-options`).
 
 .. include:: config-include.rst
 
@@ -27,19 +27,19 @@ Static Route Commands
 Static routing is a very fundamental feature of routing technology. It defines
 a static prefix and gateway, with several possible forms.
 
-.. clicmd:: ip route NETWORK GATEWAY [DISTANCE] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
+.. clicmd:: ip route NETWORK GATEWAY [DISTANCE] [weight WEIGHT] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
-.. clicmd:: ip route NETWORK IFNAME [DISTANCE] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
+.. clicmd:: ip route NETWORK IFNAME [DISTANCE] [weight WEIGHT] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
-.. clicmd:: ip route NETWORK GATEWAY IFNAME [DISTANCE] [onlink] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
+.. clicmd:: ip route NETWORK GATEWAY IFNAME [DISTANCE] [weight WEIGHT] [onlink] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
 .. clicmd:: ip route NETWORK (Null0|blackhole|reject) [DISTANCE] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
-.. clicmd:: ipv6 route NETWORK [from SRCPREFIX] GATEWAY [DISTANCE] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
+.. clicmd:: ipv6 route NETWORK [from SRCPREFIX] GATEWAY [DISTANCE] [weight WEIGHT] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
-.. clicmd:: ipv6 route NETWORK [from SRCPREFIX] IFNAME [DISTANCE] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
+.. clicmd:: ipv6 route NETWORK [from SRCPREFIX] IFNAME [DISTANCE] [weight WEIGHT] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
-.. clicmd:: ipv6 route NETWORK [from SRCPREFIX] GATEWAY IFNAME [DISTANCE] [onlink] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
+.. clicmd:: ipv6 route NETWORK [from SRCPREFIX] GATEWAY IFNAME [DISTANCE] [weight WEIGHT] [onlink] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
 .. clicmd:: ipv6 route NETWORK [from SRCPREFIX] (Null0|blackhole|reject) [DISTANCE] [table TABLENO] [nexthop-vrf VRFNAME] [vrf VRFNAME]
 
@@ -50,7 +50,9 @@ a static prefix and gateway, with several possible forms.
    v6 routes only support v6 next-hops.
 
    IFNAME is the name of the interface to use as next-hop. If only IFNAME is specified
-   (without GATEWAY), a connected route will be created.
+   (without GATEWAY), a connected route will be created. Note that
+   some of the other keywords are not valid interface names: ``vrf``,
+   ``table``, ``label``, ``tag``, ``color``, ``segments``, and ``nexthop-vrf``.
 
    When both IFNAME and GATEWAY are specified together, it binds the route to the specified
    interface. In this case, it is also possible to specify ``onlink`` to force the kernel
@@ -59,6 +61,13 @@ a static prefix and gateway, with several possible forms.
    Alternatively, the gateway can be specified as ``Null0`` or ``blackhole`` to create a blackhole
    route that drops all traffic. It can also be specified as ``reject`` to create an unreachable
    route that rejects traffic with ICMP "Destination Unreachable" messages.
+
+   WEIGHT is an optional parameter that specifies the weight attributed to a
+   nexthop when multiple nexthops are configured for the same static route. The
+   value must be between 1 and 65535. The Linux kernel only supports 8-bit
+   weights for multipath static routes, but Zebra creates and uses
+   nexthop-groups for this, for which the kernel supports 16-bit weights since
+   version 6.12.
 
    TABLENO is an optional parameter for namespaces that allows you to create the
    route in a specified table associated with the vrf namespace. ``table`` will
@@ -131,6 +140,18 @@ default) should the specified gateways not be reachable. E.g.:
      Known via "static", distance 255, metric 0
        directly connected, Null0
 
+
+A weight can be associated with each nexthop to influence traffic distribution
+across the paths. In this example, both nexthops are installed as a multipath
+route, with traffic distributed proportionally according to the configured
+weights:
+
+.. code-block:: frr
+
+   ip route 10.0.0.0/8 10.0.0.2 weight 10
+   ip route 10.0.0.0/8 10.0.0.3 weight 100
+
+
 Also, if the user wants to configure a static route for a specific VRF, then
 a specific VRF configuration mode is available. After entering into that mode
 with :clicmd:`vrf VRF` the user can enter the same route command as before,
@@ -171,11 +192,11 @@ multiple segments instructions.
 
 ::
 
-  router(config)# ipv6 route 2005::1/64 ens3 segments 2001:db8:aaaa::7/2002::4/2002::3/2002::2
+  router(config)# ipv6 route 2005::1/64 sr0 segments 2001:db8:aaaa::7/2002::4/2002::3/2002::2
 
   router# show ipv6 route
   [..]
-  S>* 2005::/64 [1/0] is directly connected, ens3, seg6 2001:db8:aaaa::7,2002::4,2002::3,2002::2, weight 1, 00:00:06
+  S>* 2005::/64 [1/0] is directly connected, sr0, seg6 2001:db8:aaaa::7,2002::4,2002::3,2002::2, weight 1, 00:00:06
 
 STATIC also supports steering of IPv4 traffic over an SRv6 SID list, as shown in the example below.
 
@@ -191,33 +212,33 @@ STATIC also supports steering of IPv4 traffic over an SRv6 SID list, as shown in
   [..]
   S>* 10.0.0.0/24 [1/0] is directly connected, sr0, seg6 fcbb:bbbb:1:2:3:fe00::, weight 1, 00:00:06
 
-  Optionally, the user can specify the SRv6 Headend Behavior to be used for encapsulation. Currently, STATIC supports the following behaviors:
+Optionally, the user can specify the SRv6 Headend Behavior to be used for encapsulation. Currently, STATIC supports the following behaviors:
 
-  * H.Encaps
-  * H.Encaps.Red
+ * H.Encaps
+ * H.Encaps.Red
 
-  When the behavior is not specified, STATIC defaults to using H.Encaps.
+When the behavior is not specified, STATIC defaults to using H.Encaps.
 
-.. clicmd:: ipv6 route X:X::X:X <X:X::X:X|nexthop> segments U:U::U:U/Y:Y::Y:Y/Z:Z::Z:Z [encap-behavior BEHAVIOR]
-.. clicmd:: ip route A.B.C.D <A.B.C.D|nexthop> segments U:U::U:U/Y:Y::Y:Y/Z:Z::Z:Z [encap-behavior BEHAVIOR]
+.. clicmd:: ipv6 route X:X::X:X <X:X::X:X|nexthop> segments U:U::U:U/Y:Y::Y:Y/Z:Z::Z:Z [encap-behavior <H_Encaps|H_Encaps_Red>]
+.. clicmd:: ip route A.B.C.D <A.B.C.D|nexthop> segments U:U::U:U/Y:Y::Y:Y/Z:Z::Z:Z [encap-behavior <H_Encaps|H_Encaps_Red>]
 
 ::
 
-  router(config)# ipv6 route 2001:db8:1:1::1/128 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H.Encaps
-  router(config)# ipv6 route 2001:db8:1:1::2/128 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H.Encaps.Red
+  router(config)# ipv6 route 2001:db8:1:1::1/128 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H_Encaps
+  router(config)# ipv6 route 2001:db8:1:1::2/128 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H_Encaps_Red
 
   router# show ipv6 route
   [..]
-  S>* 2001:db8:1:1::1/128 [1/0] is directly connected, ens3, seg6 fcbb:bbbb:1:2:3:fe00:: encap behavior H.Encaps, weight 1, 00:00:06
-  S>* 2001:db8:1:1::2/128 [1/0] is directly connected, ens3, seg6 fcbb:bbbb:1:2:3:fe00:: encap behavior H.Encaps.Red, weight 1, 00:00:06
+  S>* 2001:db8:1:1::1/128 [1/0] is directly connected, sr0, seg6 fcbb:bbbb:1:2:3:fe00::, weight 1, 00:00:06
+  S>* 2001:db8:1:1::2/128 [1/0] is directly connected, sr0, seg6 fcbb:bbbb:1:2:3:fe00::, encap behavior H.Encaps.Red, weight 1, 00:00:06
 
-  router(config)# ip route 10.0.0.1/32 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H.Encaps
-  router(config)# ip route 10.0.0.2/32 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H.Encaps.Red
+  router(config)# ip route 10.0.0.1/32 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H_Encaps
+  router(config)# ip route 10.0.0.2/32 sr0 segments fcbb:bbbb:1:2:3:fe00:: encap-behavior H_Encaps_Red
 
   router# show ip route
   [..]
-  S>* 10.0.0.1/32 [1/0] is directly connected, sr0, seg6 fcbb:bbbb:1:2:3:fe00:: encap behavior H.Encaps, weight 1, 00:00:06
-  S>* 10.0.0.2/32 [1/0] is directly connected, sr0, seg6 fcbb:bbbb:1:2:3:fe00:: encap behavior H.Encaps.Red, weight 1, 00:00:06
+  S>* 10.0.0.1/32 [1/0] is directly connected, sr0, seg6 fcbb:bbbb:1:2:3:fe00::, weight 1, 00:00:06
+  S>* 10.0.0.2/32 [1/0] is directly connected, sr0, seg6 fcbb:bbbb:1:2:3:fe00::, encap behavior H.Encaps.Red, weight 1, 00:00:06
 
 SRv6 Static SIDs Commands
 =========================

@@ -8,6 +8,10 @@
 test_zebra_neigh.py: Test some basic zebra <-> kernel neighbor interactions
 """
 
+# Pre-added in setup_module before FRR start to verify neighbor read at startup
+NEIGH_READ_TEST_IP = "192.168.0.100"
+NEIGH_READ_TEST_MAC = "aa:bb:cc:dd:ee:01"
+
 import os
 import sys
 from functools import partial
@@ -24,6 +28,8 @@ from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 from time import sleep
 
+pytestmark = [pytest.mark.mgmtd]
+
 
 def build_topo(tgen):
     "Build function"
@@ -39,8 +45,16 @@ def setup_module(mod):
 
     tgen = Topogen(build_topo, mod.__name__)
     tgen.start_topology()
-    router_list = tgen.routers()
 
+    # Add a neighbor before FRR starts to verify zebra reads the table at startup
+    r1 = tgen.gears["r1"]
+    r1.run(
+        "ip neigh add {} lladdr {} dev r1-eth0 nud reachable".format(
+            NEIGH_READ_TEST_IP, NEIGH_READ_TEST_MAC
+        )
+    )
+
+    router_list = tgen.routers()
     for _, (rname, router) in enumerate(router_list.items(), 1):
         router.load_frr_config(
             os.path.join(CWD, "{}/frr.conf".format(rname)),
@@ -77,15 +91,55 @@ def test_zebra_neighbors():
         "ip neigh add 192.168.0.4 lladdr 12:21:80:11:b1:20 dev r1-eth0 nud reachable extern_learn"
     )
 
-    output = r1.vtysh_cmd("show ip neigh").strip()
-    expected = """
-Interface            Neighbor                       MAC                #Rules
-r1-eth0              192.168.0.2                    12:21:80:11:b1:18  0
-r1-eth0              192.168.0.4                    12:21:80:11:b1:20  0
-"""
-    expected = expected.strip()
+    # Expected neighbors (192.168.0.3 is filtered - extern_learn proto zebra)
+    expected = {
+        "neighbors": [
+            {
+                "interface": "r1-eth0",
+                "neighbor": "192.168.0.2",
+                "mac": "12:21:80:11:b1:18",
+                "ruleCount": 0,
+                "state": "REACHABLE",
+            },
+            {
+                "interface": "r1-eth0",
+                "neighbor": "192.168.0.4",
+                "mac": "12:21:80:11:b1:20",
+                "ruleCount": 0,
+                "state": "REACHABLE",
+            },
+        ]
+    }
 
-    assert output == expected, '"r1" neighbor output mismatches'
+    test_func = partial(topotest.router_json_cmp, r1, "show ip neighbor json", expected)
+    _, result = topotest.run_and_expect(test_func, None, count=15, wait=1)
+    assert result is None, '"r1" neighbor JSON output mismatches: {}'.format(result)
+
+
+def test_zebra_neigh_read_at_startup():
+    "Test that a neighbor added before FRR start is visible (neighbor read at startup)."
+
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.gears["r1"]
+    expected = {
+        "neighbors": [
+            {
+                "interface": "r1-eth0",
+                "neighbor": NEIGH_READ_TEST_IP,
+                "mac": NEIGH_READ_TEST_MAC,
+                "ruleCount": 0,
+                "state": "REACHABLE",
+            }
+        ]
+    }
+    test_func = partial(topotest.router_json_cmp, r1, "show ip neighbor json", expected)
+    _, result = topotest.run_and_expect(test_func, None, count=10, wait=1)
+    assert result is None, (
+        '"r1" pre-start neighbor {} missing from show ip neighbor (read at startup failed): {}'
+    ).format(NEIGH_READ_TEST_IP, result)
 
 
 def test_memory_leak():

@@ -41,6 +41,7 @@
 #include "pim_state_refresh.h"
 #include "pim_util.h"
 #include "pim_nht.h"
+#include "pim_upstream.h"
 
 static void mroute_read_on(struct pim_instance *pim);
 
@@ -261,12 +262,30 @@ int pim_mroute_msg_nocache(int fd, struct interface *ifp, const kernmsg *msg)
 
 		if (pim_if_connected_to_source(ifp, msg->msg_im_src))
 			flags |= PIM_UPSTREAM_FLAG_MASK_FHR;
-		up = pim_upstream_find_or_add(&sg, ifp, flags, __func__);
+		{
+			struct pim_upstream *pre_up;
+			bool mfc_was_installed;
 
-		if (up->channel_oil->installed) {
-			zlog_warn("%s: NOCACHE for %pSG, MFC entry disappeared - reinstalling",
-				  ifp->name, &sg);
-			desync = true;
+			pre_up = pim_upstream_find(pim_ifp->pim, &sg);
+			mfc_was_installed = pre_up && pre_up->channel_oil->installed;
+			if (pre_up)
+				pim_upstream_ref(pre_up, flags, __func__);
+			else
+				pre_up = pim_upstream_add(pim_ifp->pim, &sg, ifp, flags, __func__,
+							  NULL);
+			up = pre_up;
+
+			/*
+			 * Avoid false "resync" on first NOCACHE: find_or_add may
+			 * install MFC in the same call, so installed is expected.
+			 * Only resync when MFC was already present before this upcall
+			 * (duplicate NOCACHE or kernel/user mismatch).
+			 */
+			if (up->channel_oil->installed && mfc_was_installed) {
+				zlog_warn("%s: NOCACHE [%s] %s: %pSG MFC already installed before this upcall; resyncing (duplicate kernel upcall or transient MFC drop)",
+					  __func__, pim_ifp->pim->vrf->name, ifp->name, &sg);
+				desync = true;
+			}
 		}
 
 		pim_upstream_keep_alive_timer_start(up, pim_ifp->pim->keep_alive_time);
@@ -372,13 +391,24 @@ int pim_mroute_msg_nocache(int fd, struct interface *ifp, const kernmsg *msg)
 	}
 
 	/* We may have already found the upstream as part of dense mode processing */
-	up = pim_upstream_find_or_add(&sg, ifp, PIM_UPSTREAM_FLAG_MASK_FHR, __func__);
+	{
+		struct pim_upstream *pre_up;
+		bool mfc_was_installed;
 
-	if (up->channel_oil->installed) {
-		zlog_warn(
-			"%s: NOCACHE for %pSG, MFC entry disappeared - reinstalling",
-			ifp->name, &sg);
-		desync = true;
+		pre_up = pim_upstream_find(pim_ifp->pim, &sg);
+		mfc_was_installed = pre_up && pre_up->channel_oil->installed;
+		if (pre_up)
+			pim_upstream_ref(pre_up, PIM_UPSTREAM_FLAG_MASK_FHR, __func__);
+		else
+			pre_up = pim_upstream_add(pim_ifp->pim, &sg, ifp,
+						  PIM_UPSTREAM_FLAG_MASK_FHR, __func__, NULL);
+		up = pre_up;
+
+		if (up->channel_oil->installed && mfc_was_installed) {
+			zlog_warn("%s: NOCACHE [%s] %s: %pSG MFC already installed before this upcall; resyncing (duplicate kernel upcall or transient MFC drop)",
+				  __func__, pim_ifp->pim->vrf->name, ifp->name, &sg);
+			desync = true;
+		}
 	}
 
 	PIM_UPSTREAM_FLAG_SET_SRC_STREAM(up->flags);
@@ -406,6 +436,7 @@ int pim_mroute_msg_nocache(int fd, struct interface *ifp, const kernmsg *msg)
 	 * install routes as needed for all cases (sm/dm)
 	 */
 	pim_upstream_inherited_olist_decide(pim_ifp->pim, up);
+	pim_upstream_update_join_desired(pim_ifp->pim, up);
 
 	/* we just got NOCACHE from the kernel, so...  MFC is not in the
 	 * kernel for some reason or another.  Try installing again.
@@ -542,7 +573,7 @@ have_up:
 
 int pim_mroute_msg_wrongvif(int fd, struct interface *ifp, const kernmsg *msg)
 {
-	struct pim_ifchannel *ch;
+	struct pim_ifchannel *ch, *throwaway;
 	struct pim_interface *pim_ifp;
 	pim_sgaddr sg;
 
@@ -578,7 +609,7 @@ int pim_mroute_msg_wrongvif(int fd, struct interface *ifp, const kernmsg *msg)
 		return -2;
 	}
 
-	ch = pim_ifchannel_find(ifp, &sg);
+	pim_ifchannel_find(ifp, &sg, &ch, &throwaway);
 	if (!ch) {
 		pim_sgaddr star_g = sg;
 		if (PIM_DEBUG_MROUTE)
@@ -587,7 +618,7 @@ int pim_mroute_msg_wrongvif(int fd, struct interface *ifp, const kernmsg *msg)
 				__func__, &sg, ifp->name);
 
 		star_g.src = PIMADDR_ANY;
-		ch = pim_ifchannel_find(ifp, &star_g);
+		pim_ifchannel_find(ifp, &star_g, &ch, &throwaway);
 		if (!ch) {
 			if (PIM_DEBUG_MROUTE)
 				zlog_debug(
@@ -655,7 +686,7 @@ int pim_mroute_msg_wrvifwhole(int fd, struct interface *ifp, const char *buf,
 	const ipv_hdr *ip_hdr = (const ipv_hdr *)buf;
 	struct pim_interface *pim_ifp;
 	struct pim_instance *pim;
-	struct pim_ifchannel *ch;
+	struct pim_ifchannel *ch, *throwaway;
 	struct pim_upstream *up;
 	pim_sgaddr star_g;
 	pim_sgaddr sg;
@@ -684,7 +715,7 @@ int pim_mroute_msg_wrvifwhole(int fd, struct interface *ifp, const char *buf,
 		return 0;
 	}
 
-	ch = pim_ifchannel_find(ifp, &sg);
+	pim_ifchannel_find(ifp, &sg, &ch, &throwaway);
 	if (ch) {
 		if (PIM_DEBUG_MROUTE)
 			zlog_debug(
@@ -923,21 +954,17 @@ int pim_mroute_msg(struct pim_instance *pim, const char *buf, size_t buf_size,
 			return 0;
 		if (PIM_DEBUG_MROUTE) {
 #if PIM_IPV == 4
-			zlog_debug(
-				"%s: pim kernel upcall %s type=%d ip_p=%d from fd=%d for (S,G)=(%pI4,%pI4) on %s vifi=%d  size=%ld",
-				__func__, gmmsgtype2str[msg->msg_im_msgtype],
-				msg->msg_im_msgtype, ip_hdr->ip_p,
-				pim->mroute_socket, &msg->msg_im_src,
-				&msg->msg_im_dst, ifp->name, msg->msg_im_vif,
-				(long int)buf_size);
+			zlog_debug("%s: [%s] pim kernel upcall %s type=%d ip_p=%d from fd=%d for (S,G)=(%pI4,%pI4) on %s vifi=%d size=%ld",
+				   __func__, pim->vrf->name, gmmsgtype2str[msg->msg_im_msgtype],
+				   msg->msg_im_msgtype, ip_hdr->ip_p, pim->mroute_socket,
+				   &msg->msg_im_src, &msg->msg_im_dst, ifp->name, msg->msg_im_vif,
+				   (long int)buf_size);
 #else
-			zlog_debug(
-				"%s: pim kernel upcall %s type=%d ip_p=%d from fd=%d for (S,G)=(%pI6,%pI6) on %s vifi=%d  size=%ld",
-				__func__, gmmsgtype2str[msg->msg_im_msgtype],
-				msg->msg_im_msgtype, ip_hdr->ip6_nxt,
-				pim->mroute_socket, &msg->msg_im_src,
-				&msg->msg_im_dst, ifp->name, msg->msg_im_vif,
-				(long int)buf_size);
+			zlog_debug("%s: [%s] pim kernel upcall %s type=%d ip_p=%d from fd=%d for (S,G)=(%pI6,%pI6) on %s vifi=%d size=%ld",
+				   __func__, pim->vrf->name, gmmsgtype2str[msg->msg_im_msgtype],
+				   msg->msg_im_msgtype, ip_hdr->ip6_nxt, pim->mroute_socket,
+				   &msg->msg_im_src, &msg->msg_im_dst, ifp->name, msg->msg_im_vif,
+				   (long int)buf_size);
 #endif
 		}
 
@@ -1195,7 +1222,7 @@ int pim_mroute_del_vif(struct interface *ifp)
  *
  * This is a protection against implementation mistakes.
  *
- * PIM protocol implicitely ensures loopfree multicast topology.
+ * PIM protocol implicitly ensures loopfree multicast topology.
  *
  * IGMP must be protected against adding looped MFC entries created
  * by both source and receiver attached to the same interface. See
@@ -1283,7 +1310,7 @@ static int pim_mroute_add(struct channel_oil *c_oil, const char *name)
 	 * it is owned by the pimreg for the incoming IIF
 	 * So set pimreg as the IIF temporarily to cause
 	 * the packets to be forwarded.  Then set it
-	 * to the correct IIF afterwords.
+	 * to the correct IIF afterwards.
 	 */
 	if (!c_oil->installed && !pim_addr_is_any(*oil_origin(c_oil)) &&
 	    *oil_incoming_vif(c_oil) != 0) {

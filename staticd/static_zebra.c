@@ -463,6 +463,7 @@ extern void static_zebra_route_add(struct static_path *pn, bool install)
 
 		zapi_nexthop_init(api_nh);
 		api_nh->vrf_id = nh->nh_vrf_id;
+		api_nh->weight = nh->weight;
 		if (nh->onlink)
 			SET_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_ONLINK);
 		if (nh->color != 0) {
@@ -1369,6 +1370,9 @@ static int static_zebra_process_srv6_locator_delete(ZAPI_CALLBACK_ARGS)
 		 */
 		if (CHECK_FLAG(sid->flags, STATIC_FLAG_SRV6_SID_SENT_TO_ZEBRA))
 			static_zebra_srv6_sid_uninstall(sid);
+
+		sid->locator = NULL;
+		UNSET_FLAG(sid->flags, STATIC_FLAG_SRV6_SID_VALID);
 	}
 
 	listnode_delete(srv6_locators, locator);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* BGP network related fucntions
+/* BGP network related functions
  * Copyright (C) 1999 Kunihiro Ishiguro
  */
 
@@ -33,6 +33,7 @@
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_trace.h"
+#include "bgpd/bgp_vty.h"
 
 extern struct zebra_privs_t bgpd_privs;
 
@@ -512,7 +513,21 @@ static void bgp_accept(struct event *event)
 		struct peer *dynamic_peer = peer_lookup_dynamic_neighbor(bgp, &su);
 
 		if (dynamic_peer) {
+			if (peergroup_flag_check(dynamic_peer, PEER_FLAG_RPKI_STRICT) &&
+			    !bgp_rpki_cache_connected(dynamic_peer->bgp)) {
+				if (bgp_debug_neighbor_events(dynamic_peer))
+					zlog_debug("[Event] Incoming BGP connection rejected from %s due to RPKI cache not connected (strict mode)",
+						   dynamic_peer->host);
+				peer_delete(dynamic_peer);
+				close(bgp_sock);
+				return;
+			}
+
 			incoming = dynamic_peer->connection;
+
+			atomic_store_explicit(&incoming->last_sendq_ok, monotime(NULL),
+					      memory_order_relaxed);
+
 			/* Dynamic neighbor has been created, let it proceed */
 			incoming->fd = bgp_sock;
 
@@ -526,6 +541,9 @@ static void bgp_accept(struct event *event)
 					 __func__, dynamic_peer->host, safe_strerror(errno), errno);
 				frrtrace(3, frr_bgp, bgp_err_str, dynamic_peer->host,
 					 dynamic_peer->flags, 1);
+
+				incoming->fd = -1;
+				close(bgp_sock);
 				return;
 			}
 
@@ -587,7 +605,7 @@ static void bgp_accept(struct event *event)
 
 	/*
 	 * Do not accept incoming connections in Clearing state. This can result
-	 * in incorect state transitions - e.g., the connection goes back to
+	 * in incorrect state transitions - e.g., the connection goes back to
 	 * Established and then the Clearing_Completed event is generated. Also,
 	 * block incoming connection in Deleted state.
 	 */
@@ -634,6 +652,16 @@ static void bgp_accept(struct event *event)
 		return;
 	}
 
+	if (peergroup_flag_check(peer, PEER_FLAG_RPKI_STRICT) &&
+	    !bgp_rpki_cache_connected(peer->bgp)) {
+		if (bgp_debug_neighbor_events(peer))
+			zlog_debug("[Event] Incoming BGP connection rejected from %s due to RPKI cache not connected (strict mode)",
+				   peer->host);
+		peer_set_last_reset(peer, PEER_DOWN_RPKI_DOWN);
+		close(bgp_sock);
+		return;
+	}
+
 	if (bgp_debug_neighbor_events(peer))
 		zlog_debug("[Event] connection from %s fd %d, active peer status %d fd %d",
 			   inet_sutop(&su, buf), bgp_sock, connection->status, connection->fd);
@@ -672,6 +700,7 @@ static void bgp_accept(struct event *event)
 	incoming->fd = bgp_sock;
 	incoming->su_local = sockunion_getsockname(incoming->fd);
 	incoming->su_remote = sockunion_dup(&su);
+	atomic_store_explicit(&incoming->last_sendq_ok, monotime(NULL), memory_order_relaxed);
 
 	if (bgp_set_socket_ttl(incoming) < 0)
 		if (bgp_debug_neighbor_events(doppelganger))
@@ -812,6 +841,8 @@ enum connect_result bgp_connect(struct peer_connection *connection)
 
 	assert(!CHECK_FLAG(connection->thread_flags, PEER_THREAD_WRITES_ON));
 	assert(!CHECK_FLAG(connection->thread_flags, PEER_THREAD_READS_ON));
+
+	atomic_store_explicit(&connection->last_sendq_ok, monotime(NULL), memory_order_relaxed);
 
 	if (peer->bgp->router_id.s_addr == INADDR_ANY) {
 		peer_set_last_reset(peer, PEER_DOWN_ROUTER_ID_ZERO);
@@ -959,12 +990,48 @@ int bgp_getsockname(struct peer_connection *connection)
 	return 0;
 }
 
+/*
+ * Non-default VRF: apply TCP MD5 on the listen socket for one listen-range
+ * prefix (see bgp_listener).
+ *
+ * Returns 0 on success or when MD5 is not configured for this range; on
+ * failure returns bgp_md5_set_socket()'s value (negative, not always -1).
+ */
+static int bgp_listener_md5_listen_range(struct bgp_listener *listener, struct peer_group *group,
+					 struct prefix *prefix, struct peer *peer)
+{
+	union sockunion su;
+	int md5_ret;
+
+	if (!peer || !peer->password)
+		return 0;
+
+	/* bgp_listener() is per-socket (AF_INET vs AF_INET6); skip wrong family */
+	if (listener->su.sa.sa_family != prefix->family)
+		return 0;
+
+	prefix2sockunion(prefix, &su);
+	md5_ret = bgp_md5_set_socket(listener->fd, &su, prefix->prefixlen, peer->password);
+	if (md5_ret < 0) {
+		int md5_errno = errno;
+
+		flog_err(EC_BGP_NO_TCP_MD5,
+			 "%s: TCP MD5 not applied on listen socket (fd %d) for peer-group %s listen range %pFX: %s",
+			 listener->name ? listener->name : VRF_DEFAULT_NAME, listener->fd,
+			 group->name ? group->name : "?", prefix, safe_strerror(md5_errno));
+		return md5_ret;
+	}
+	return 0;
+}
 
 static int bgp_listener(int sock, struct sockaddr *sa, socklen_t salen,
 			struct bgp *bgp)
 {
 	struct bgp_listener *listener;
 	int ret, en;
+	bool md5_ok = true;
+	struct listnode *node, *nnode;
+	struct peer_group *group;
 
 	sockopt_reuseaddr(sock);
 	sockopt_reuseport(sock);
@@ -1004,9 +1071,56 @@ static int bgp_listener(int sock, struct sockaddr *sa, socklen_t salen,
 		listener->bgp = bgp;
 
 	memcpy(&listener->su, sa, salen);
+
+	/*
+	 * Default VRF: listen-range MD5 is applied from bgp_md5_set_prefix()
+	 * when the password / range is configured. Non-default VRF listeners
+	 * have listener->bgp set and are skipped by that path, so apply MD5
+	 * here when the socket is created, before registering the listener so
+	 * a failure does not require cancelling the read event or removing the
+	 * socket from the global list.
+	 */
+	if (bgp->vrf_id == VRF_DEFAULT) {
+		event_add_read(bm->master, bgp_accept, listener, sock, &listener->event);
+		listnode_add(bm->listen_sockets, listener);
+		return 0;
+	}
+
+	frr_with_privs (&bgpd_privs) {
+		for (ALL_LIST_ELEMENTS(bgp->group, node, nnode, group)) {
+			struct listnode *ln;
+			struct prefix *prefix;
+			struct peer *peer = group->conf;
+
+			for (ALL_LIST_ELEMENTS_RO(group->listen_range[AFI_IP], ln, prefix)) {
+				if (bgp_listener_md5_listen_range(listener, group, prefix, peer) <
+				    0) {
+					md5_ok = false;
+					break;
+				}
+			}
+			if (!md5_ok)
+				break;
+
+			for (ALL_LIST_ELEMENTS_RO(group->listen_range[AFI_IP6], ln, prefix)) {
+				if (bgp_listener_md5_listen_range(listener, group, prefix, peer) <
+				    0) {
+					md5_ok = false;
+					break;
+				}
+			}
+			if (!md5_ok)
+				break;
+		}
+	}
+	if (!md5_ok) {
+		XFREE(MTYPE_BGP_LISTENER, listener->name);
+		XFREE(MTYPE_BGP_LISTENER, listener);
+		return -1;
+	}
+
 	event_add_read(bm->master, bgp_accept, listener, sock, &listener->event);
 	listnode_add(bm->listen_sockets, listener);
-
 	return 0;
 }
 

@@ -85,7 +85,7 @@ struct bgp_dest {
 
 	STAILQ_ENTRY(bgp_dest) pq;
 
-	struct zebra_announce_item zai;
+	struct bgp_bp_install_node *za_inode;
 	struct bgp_path_info *za_bgp_pi;
 	struct bgpevpn *za_vpn;
 	bool za_is_sync;
@@ -93,6 +93,8 @@ struct bgp_dest {
 	uint64_t version;
 
 	mpls_label_t local_label;
+
+	struct bgp_ls_nlri *ls_nlri;
 
 	struct bgp_attr_srv6_l3service *srv6_unicast;
 
@@ -110,6 +112,7 @@ struct bgp_dest {
 #define BGP_NODE_SCHEDULE_FOR_INSTALL	(1 << 10)
 #define BGP_NODE_SCHEDULE_FOR_DELETE	(1 << 11)
 #define BGP_NODE_NHT_RESOLVED_NODE	(1 << 12)
+#define BGP_NODE_ZEBRA_ANNOUNCE_EARLY	(1 << 13)
 
 	struct bgp_addpath_node_data tx_addpath;
 
@@ -119,7 +122,7 @@ struct bgp_dest {
 	struct bgp_path_info_mpath *mpath;
 };
 
-DECLARE_LIST(zebra_announce, struct bgp_dest, zai);
+DECLARE_LIST(zebra_announce, struct bgp_bp_install_node, zai);
 
 extern void bgp_delete_listnode(struct bgp_dest *dest);
 /*
@@ -264,7 +267,7 @@ static inline struct bgp_dest *bgp_node_get(struct bgp_table *const table,
 						sizeof(struct bgp_dest));
 
 		RB_INIT(bgp_adj_out_rb, &dest->adj_out);
-		rn->info = dest;
+		route_node_set_info(rn, dest);
 		dest->rn = rn;
 	}
 	return rn->info;
@@ -294,7 +297,7 @@ static inline struct bgp_dest *bgp_node_match(const struct bgp_table *table,
 
 static inline unsigned long bgp_table_count(const struct bgp_table *const table)
 {
-	return route_table_count(table->route_table);
+	return route_table_info_count(table->route_table);
 }
 
 /*

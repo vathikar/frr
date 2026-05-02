@@ -50,7 +50,7 @@ static void sbfd_up_handler(struct bfd_session *bs, int nstate);
  * Remove BFD profile from all BFD sessions so we don't leave dangling
  * pointers.
  */
-static void bfd_profile_detach(struct bfd_profile *bp);
+static void bfd_profile_detach(struct bfd_profile *bp, bool suppress_profile);
 
 /* Zeroed array with the size of an IPv6 address. */
 struct in6_addr zero_addr;
@@ -121,11 +121,11 @@ struct bfd_profile *bfd_profile_new(const char *name)
 	return bp;
 }
 
-void bfd_profile_free(struct bfd_profile *bp)
+void bfd_profile_free(struct bfd_profile *bp, bool suppress_profile)
 {
 	/* Detach from any session. */
 	if (bglobal.bg_shutdown == false)
-		bfd_profile_detach(bp);
+		bfd_profile_detach(bp, suppress_profile);
 
 	/* Remove from global list. */
 	TAILQ_REMOVE(&bplist, bp, entry);
@@ -251,13 +251,18 @@ void bfd_session_apply(struct bfd_session *bs)
 	bfd_dplane_update_session(bs);
 }
 
+static void bfd_profile_remove_reference(struct bfd_session *bs)
+{
+	bs->profile = NULL;
+
+	bfd_session_apply(bs);
+}
+
 void bfd_profile_remove(struct bfd_session *bs)
 {
 	/* Remove any previous set profile name. */
 	XFREE(MTYPE_BFDD_PROFILE, bs->profile_name);
-	bs->profile = NULL;
-
-	bfd_session_apply(bs);
+	bfd_profile_remove_reference(bs);
 }
 
 void gen_bfd_key(struct bfd_key *key, struct sockaddr_any *peer, struct sockaddr_any *local,
@@ -324,6 +329,7 @@ int bfd_session_enable(struct bfd_session *bs)
 {
 	struct interface *ifp = NULL;
 	struct vrf *vrf = NULL;
+	struct bfd_vrf_global *bvrf;
 	int psock;
 
 	/* We are using data plane, we don't need software. */
@@ -348,6 +354,7 @@ int bfd_session_enable(struct bfd_session *bs)
 	}
 
 	assert(vrf);
+	bvrf = vrf->info;
 
 	if (bs->key.ifname[0]) {
 		ifp = if_lookup_by_name(bs->key.ifname, vrf->vrf_id);
@@ -410,6 +417,16 @@ int bfd_session_enable(struct bfd_session *bs)
 	 */
 	bs->sock = psock;
 
+	/*
+	 * Track active sessions per VRF for dynamic socket management.
+	 * Open VRF listening sockets on the first session;
+	 */
+	if (bvrf) {
+		if (bvrf->bg_session_count == 0)
+			bfd_vrf_start_sockets(bvrf);
+		bvrf->bg_session_count++;
+	}
+
 	/* Only start timers if we are using active mode. */
 	if (CHECK_FLAG(bs->flags, BFD_SESS_FLAG_PASSIVE) == 0) {
 		if (bs->bfd_mode == BFD_MODE_TYPE_SBFD_ECHO) {
@@ -446,8 +463,24 @@ void bfd_session_disable(struct bfd_session *bs)
 
 	frrtrace(2, frr_bfd, session_enable_event, false, bs);
 
-	/* Free up socket resources. */
+	/* Free up socket resources and update VRF session count. */
 	if (bs->sock != -1) {
+		if (bs->vrf && bs->vrf->info) {
+			struct bfd_vrf_global *bvrf = bs->vrf->info;
+
+			if (bvrf->bg_session_count > 0) {
+				bvrf->bg_session_count--;
+
+				/*
+				 * Last session in this VRF: close the shared
+				 * listening sockets if no reflectors need them.
+				 */
+				if (bvrf->bg_session_count == 0 &&
+				    bvrf->bg_reflector_count == 0)
+					bfd_vrf_stop_sockets(bvrf);
+			}
+		}
+
 		close(bs->sock);
 		bs->sock = -1;
 	}
@@ -460,7 +493,7 @@ void bfd_session_disable(struct bfd_session *bs)
 	bs->ifp = NULL;
 
 	/* Set session down so it doesn't report UP and disabled. */
-	ptm_bfd_sess_dn(bs, BD_PATH_DOWN);
+	ptm_bfd_sess_dn(bs, BD_PATH_DOWN, false);
 }
 
 static uint32_t ptm_bfd_gen_ID(void)
@@ -487,7 +520,7 @@ void ptm_bfd_start_xmt_timer(struct bfd_session *bfd, bool is_echo)
 	xmt_TO = is_echo ? bfd->echo_xmt_TO : bfd->xmt_TO;
 
 	/*
-	 * From section 6.5.2: trasmit interval should be randomly jittered
+	 * From section 6.5.2: transmit interval should be randomly jittered
 	 * between
 	 * 75% and 100% of nominal value, unless detect_mult is 1, then should
 	 * be
@@ -622,7 +655,17 @@ void ptm_bfd_sess_up(struct bfd_session *bfd)
 	}
 }
 
-void ptm_bfd_sess_dn(struct bfd_session *bfd, uint8_t diag)
+/*
+ * Transition BFD session to DOWN state.
+ *
+ * @param bfd BFD session
+ * @param diag Diagnostic code explaining reason for transition
+ * @param notify_admin_down If true, notify clients with ADMIN_DOWN status
+ *                          instead of DOWN. This is used when remote peer
+ *                          sends Admin Down - local state goes to DOWN but
+ *                          clients should not tear down protocol sessions.
+ */
+void ptm_bfd_sess_dn(struct bfd_session *bfd, uint8_t diag, bool notify_admin_down)
 {
 	int old_state = bfd->ses_state;
 
@@ -646,8 +689,17 @@ void ptm_bfd_sess_dn(struct bfd_session *bfd, uint8_t diag)
 	bs_set_slow_timers(bfd);
 
 	/* only signal clients when going from up->down state */
-	if (old_state == PTM_BFD_UP)
-		ptm_bfd_notify(bfd, PTM_BFD_DOWN);
+	if (old_state == PTM_BFD_UP) {
+		/*
+		 * If remote peer sent Admin Down, notify clients with
+		 * ADMIN_DOWN status so they don't tear down protocol sessions.
+		 * Otherwise, notify with DOWN status as usual.
+		 */
+		if (notify_admin_down)
+			ptm_bfd_notify(bfd, PTM_BFD_ADM_DOWN);
+		else
+			ptm_bfd_notify(bfd, PTM_BFD_DOWN);
+	}
 
 	/* Stop echo packet transmission if they are active */
 	if (CHECK_FLAG(bfd->flags, BFD_SESS_FLAG_ECHO_ACTIVE))
@@ -857,7 +909,7 @@ void bfd_recvtimer_cb(struct event *t)
 	switch (bs->ses_state) {
 	case PTM_BFD_INIT:
 	case PTM_BFD_UP:
-		ptm_bfd_sess_dn(bs, BD_CONTROL_EXPIRED);
+		ptm_bfd_sess_dn(bs, BD_CONTROL_EXPIRED, false);
 		break;
 	}
 }
@@ -875,7 +927,7 @@ void bfd_echo_recvtimer_cb(struct event *t)
 	switch (bs->ses_state) {
 	case PTM_BFD_INIT:
 	case PTM_BFD_UP:
-		ptm_bfd_sess_dn(bs, BD_ECHO_FAILED);
+		ptm_bfd_sess_dn(bs, BD_ECHO_FAILED, false);
 		break;
 	}
 }
@@ -1125,7 +1177,7 @@ struct bfd_session *ptm_bfd_sess_new(struct bfd_peer_cfg *bpc)
 
 struct bfd_session *bs_registrate(struct bfd_session *bfd)
 {
-	/* Registrate session into data structures. */
+	/* Register session into data structures. */
 	bfd_key_insert(bfd);
 	bfd->discrs.my_discr = ptm_bfd_gen_ID();
 	bfd_id_insert(bfd);
@@ -1284,10 +1336,11 @@ static void bs_init_handler(struct bfd_session *bs, int nstate)
 	switch (nstate) {
 	case PTM_BFD_ADM_DOWN:
 		/*
-		 * Remote peer doesn't want to talk, so lets make the
-		 * connection down.
+		 * Remote peer sent Admin Down.
+		 * Go to DOWN state but notify clients with ADMIN_DOWN
+		 * so they don't tear down their protocol sessions.
 		 */
-		ptm_bfd_sess_dn(bs, BD_NEIGHBOR_DOWN);
+		ptm_bfd_sess_dn(bs, BD_NEIGHBOR_DOWN, true);
 		break;
 
 	case PTM_BFD_DOWN:
@@ -1312,9 +1365,16 @@ static void bs_up_handler(struct bfd_session *bs, int nstate)
 {
 	switch (nstate) {
 	case PTM_BFD_ADM_DOWN:
+		/*
+		 * Remote peer sent Admin Down.
+		 * Go to DOWN state but notify clients with ADMIN_DOWN
+		 * so they don't tear down their protocol sessions.
+		 */
+		ptm_bfd_sess_dn(bs, BD_NEIGHBOR_DOWN, true);
+		break;
 	case PTM_BFD_DOWN:
-		/* Peer lost or asked to shutdown connection. */
-		ptm_bfd_sess_dn(bs, BD_NEIGHBOR_DOWN);
+		/* Peer lost connection - bring session down normally. */
+		ptm_bfd_sess_dn(bs, BD_NEIGHBOR_DOWN, false);
 		break;
 
 	case PTM_BFD_INIT:
@@ -2222,7 +2282,7 @@ void bfd_shutdown(void)
 
 	/* Free all profile allocations. */
 	while ((bp = TAILQ_FIRST(&bplist)) != NULL)
-		bfd_profile_free(bp);
+		bfd_profile_free(bp, true);
 }
 
 struct bfd_session_iterator {
@@ -2318,7 +2378,7 @@ void bfd_profiles_remove(void)
 	struct bfd_profile *bp;
 
 	while ((bp = TAILQ_FIRST(&bplist)) != NULL)
-		bfd_profile_free(bp);
+		bfd_profile_free(bp, true);
 }
 
 struct __bfd_session_echo {
@@ -2404,21 +2464,36 @@ void bfd_profile_update(struct bfd_profile *bp)
 	hash_iterate(bfd_key_hash, _bfd_profile_update, bp);
 }
 
+struct bfd_profile_detach_info {
+	struct bfd_profile *bp;
+	bool suppress_config;
+};
+
 static void _bfd_profile_detach(struct hash_bucket *hb, void *arg)
 {
-	struct bfd_profile *bp = arg;
+	struct bfd_profile_detach_info *prof_info = arg;
+	struct bfd_profile *bp;
 	struct bfd_session *bs = hb->data;
+
+	bp = prof_info->bp;
 
 	/* This session is not using the profile. */
 	if (bs->profile_name == NULL || strcmp(bs->profile_name, bp->name) != 0)
 		return;
 
-	bfd_profile_remove(bs);
+	if (prof_info->suppress_config)
+		bfd_profile_remove(bs);
+	else
+		bfd_profile_remove_reference(bs);
 }
 
-static void bfd_profile_detach(struct bfd_profile *bp)
+static void bfd_profile_detach(struct bfd_profile *bp, bool suppress_profile)
 {
-	hash_iterate(bfd_key_hash, _bfd_profile_detach, bp);
+	struct bfd_profile_detach_info prof_info = {};
+
+	prof_info.bp = bp;
+	prof_info.suppress_config = suppress_profile;
+	hash_iterate(bfd_key_hash, _bfd_profile_detach, &prof_info);
 }
 
 /*
@@ -2519,50 +2594,17 @@ static int bfd_vrf_delete(struct vrf *vrf)
 
 static int bfd_vrf_enable(struct vrf *vrf)
 {
-	struct bfd_vrf_global *bvrf = vrf->info;
-
 	if (bglobal.debug_zebra)
 		zlog_debug("VRF enable add %s id %u", vrf->name, vrf->vrf_id);
 
 	frrtrace(2, frr_bfd, vrf_lifecycle, 3, vrf->vrf_id);
 
-	/* Don't open sockets when using data plane */
-	if (bglobal.bg_use_dplane)
-		goto skip_sockets;
+	/*
+	 * Sockets are no longer opened here statically.
+	 * They will be created dynamically when the first BFD session
+	 * is enabled for this VRF (see bfd_session_enable()).
+	 */
 
-	if (!bfd_vrf_is_perm(vrf->name))
-		return 0;
-
-	if (bvrf->bg_shop == -1)
-		bvrf->bg_shop = bp_udp_shop(vrf);
-	if (bvrf->bg_mhop == -1)
-		bvrf->bg_mhop = bp_udp_mhop(vrf);
-	if (bvrf->bg_shop6 == -1)
-		bvrf->bg_shop6 = bp_udp6_shop(vrf);
-	if (bvrf->bg_mhop6 == -1)
-		bvrf->bg_mhop6 = bp_udp6_mhop(vrf);
-	if (bvrf->bg_initv6 == -1)
-		bvrf->bg_initv6 = bp_initv6_socket(vrf);
-
-	if (bvrf->bg_ev[0] == NULL && bvrf->bg_shop != -1)
-		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_shop,
-			       &bvrf->bg_ev[0]);
-	if (bvrf->bg_ev[1] == NULL && bvrf->bg_mhop != -1)
-		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_mhop,
-			       &bvrf->bg_ev[1]);
-	if (bvrf->bg_ev[2] == NULL && bvrf->bg_shop6 != -1)
-		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_shop6,
-			       &bvrf->bg_ev[2]);
-	if (bvrf->bg_ev[3] == NULL && bvrf->bg_mhop6 != -1)
-		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_mhop6,
-			       &bvrf->bg_ev[3]);
-	if (bvrf->bg_ev[6] == NULL && bvrf->bg_initv6 != -1)
-		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_initv6, &bvrf->bg_ev[6]);
-
-	/* Toggle echo if VRF was disabled. */
-	bfd_vrf_toggle_echo(bvrf);
-
-skip_sockets:
 	if (vrf->vrf_id != VRF_DEFAULT) {
 		bfdd_zclient_register(vrf->vrf_id);
 		bfdd_sessions_enable_vrf(vrf);
@@ -2589,23 +2631,10 @@ static int bfd_vrf_disable(struct vrf *vrf)
 
 	frrtrace(2, frr_bfd, vrf_lifecycle, 4, vrf->vrf_id);
 
-	/* Disable read/write poll triggering. */
-	event_cancel(&bvrf->bg_ev[0]);
-	event_cancel(&bvrf->bg_ev[1]);
-	event_cancel(&bvrf->bg_ev[2]);
-	event_cancel(&bvrf->bg_ev[3]);
-	event_cancel(&bvrf->bg_ev[4]);
-	event_cancel(&bvrf->bg_ev[5]);
-	event_cancel(&bvrf->bg_ev[6]);
-
-	/* Close all descriptors. */
-	socket_close(&bvrf->bg_echo);
-	socket_close(&bvrf->bg_shop);
-	socket_close(&bvrf->bg_mhop);
-	socket_close(&bvrf->bg_shop6);
-	socket_close(&bvrf->bg_mhop6);
-	socket_close(&bvrf->bg_echov6);
-	socket_close(&bvrf->bg_initv6);
+	/* Close all sockets and cancel events for this VRF. */
+	bfd_vrf_stop_sockets(bvrf);
+	bvrf->bg_session_count = 0;
+	bvrf->bg_reflector_count = 0;
 
 	return 0;
 }
@@ -2646,6 +2675,8 @@ unsigned long bfd_get_session_count(void)
 struct sbfd_reflector *sbfd_reflector_new(const uint32_t discr, struct in6_addr *sip)
 {
 	struct sbfd_reflector *sr;
+	struct vrf *vrf;
+	struct bfd_vrf_global *bvrf;
 
 	sr = sbfd_discr_lookup(discr);
 	if (sr)
@@ -2657,6 +2688,16 @@ struct sbfd_reflector *sbfd_reflector_new(const uint32_t discr, struct in6_addr 
 
 	sbfd_discr_insert(sr);
 
+	vrf = vrf_lookup_by_id(VRF_DEFAULT);
+	if (vrf) {
+		bvrf = vrf->info;
+		if (bvrf) {
+			if (bvrf->bg_reflector_count == 0 &&
+			    bvrf->bg_session_count == 0)
+				bfd_vrf_start_sockets(bvrf);
+			bvrf->bg_reflector_count++;
+		}
+	}
 
 	return sr;
 }
@@ -2664,6 +2705,8 @@ struct sbfd_reflector *sbfd_reflector_new(const uint32_t discr, struct in6_addr 
 void sbfd_reflector_free(const uint32_t discr)
 {
 	struct sbfd_reflector *sr;
+	struct vrf *vrf;
+	struct bfd_vrf_global *bvrf;
 
 	sr = sbfd_discr_lookup(discr);
 	if (!sr)
@@ -2672,7 +2715,16 @@ void sbfd_reflector_free(const uint32_t discr)
 	sbfd_discr_delete(discr);
 	XFREE(MTYPE_SBFD_REFLECTOR, sr);
 
-	return;
+	vrf = vrf_lookup_by_id(VRF_DEFAULT);
+	if (vrf) {
+		bvrf = vrf->info;
+		if (bvrf && bvrf->bg_reflector_count > 0) {
+			bvrf->bg_reflector_count--;
+			if (bvrf->bg_reflector_count == 0 &&
+			    bvrf->bg_session_count == 0)
+				bfd_vrf_stop_sockets(bvrf);
+		}
+	}
 }
 
 void sbfd_reflector_flush(void)
@@ -2725,4 +2777,95 @@ void bfd_rtt_init(struct bfd_session *bfd)
 	bfd->rtt_index = 0;
 	for (i = 0; i < BFD_RTT_SAMPLE; i++)
 		bfd->rtt[i] = 0;
+}
+
+/*
+ * Dynamic BFD socket management functions.
+ *
+ * Sockets are created on demand when the first BFD session is enabled
+ * for a VRF, and closed when the last session is disabled.
+ */
+
+/*
+ * bfd_vrf_start_sockets: open all listening sockets for a VRF.
+ *
+ * Sockets are created dynamically on demand when the first BFD session
+ * is enabled for this VRF. This function is idempotent - it only opens
+ * sockets that are not already open.
+ */
+int bfd_vrf_start_sockets(struct bfd_vrf_global *bvrf)
+{
+	/* Don't open sockets when using data plane. */
+	if (bglobal.bg_use_dplane)
+		return 0;
+
+	if (!bfd_vrf_is_perm(bvrf->vrf->name))
+		return 0;
+
+	if (bglobal.debug_zebra)
+		zlog_debug("VRF start sockets %s id %u", bvrf->vrf->name,
+			   bvrf->vrf->vrf_id);
+
+	if (bvrf->bg_shop == -1)
+		bvrf->bg_shop = bp_udp_shop(bvrf->vrf);
+	if (bvrf->bg_mhop == -1)
+		bvrf->bg_mhop = bp_udp_mhop(bvrf->vrf);
+	if (bvrf->bg_shop6 == -1)
+		bvrf->bg_shop6 = bp_udp6_shop(bvrf->vrf);
+	if (bvrf->bg_mhop6 == -1)
+		bvrf->bg_mhop6 = bp_udp6_mhop(bvrf->vrf);
+	if (bvrf->bg_initv6 == -1)
+		bvrf->bg_initv6 = bp_initv6_socket(bvrf->vrf);
+
+	if (bvrf->bg_ev[0] == NULL && bvrf->bg_shop != -1)
+		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_shop,
+			       &bvrf->bg_ev[0]);
+	if (bvrf->bg_ev[1] == NULL && bvrf->bg_mhop != -1)
+		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_mhop,
+			       &bvrf->bg_ev[1]);
+	if (bvrf->bg_ev[2] == NULL && bvrf->bg_shop6 != -1)
+		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_shop6,
+			       &bvrf->bg_ev[2]);
+	if (bvrf->bg_ev[3] == NULL && bvrf->bg_mhop6 != -1)
+		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_mhop6,
+			       &bvrf->bg_ev[3]);
+	if (bvrf->bg_ev[6] == NULL && bvrf->bg_initv6 != -1)
+		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_initv6,
+			       &bvrf->bg_ev[6]);
+
+	/* Open echo sockets if any session in this VRF uses echo mode. */
+	bfd_vrf_toggle_echo(bvrf);
+
+	return 0;
+}
+
+/*
+ * bfd_vrf_stop_sockets: close all listening sockets for a VRF.
+ *
+ * Called when the last BFD session in a VRF is disabled, or when
+ * the VRF itself is disabled/deleted.
+ */
+void bfd_vrf_stop_sockets(struct bfd_vrf_global *bvrf)
+{
+	if (bglobal.debug_zebra)
+		zlog_debug("VRF stop sockets %s id %d", bvrf->vrf->name,
+			   bvrf->vrf->vrf_id);
+
+	/* Disable read/write poll triggering. */
+	event_cancel(&bvrf->bg_ev[0]);
+	event_cancel(&bvrf->bg_ev[1]);
+	event_cancel(&bvrf->bg_ev[2]);
+	event_cancel(&bvrf->bg_ev[3]);
+	event_cancel(&bvrf->bg_ev[4]);
+	event_cancel(&bvrf->bg_ev[5]);
+	event_cancel(&bvrf->bg_ev[6]);
+
+	/* Close all descriptors. */
+	socket_close(&bvrf->bg_echo);
+	socket_close(&bvrf->bg_shop);
+	socket_close(&bvrf->bg_mhop);
+	socket_close(&bvrf->bg_shop6);
+	socket_close(&bvrf->bg_mhop6);
+	socket_close(&bvrf->bg_echov6);
+	socket_close(&bvrf->bg_initv6);
 }

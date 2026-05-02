@@ -38,9 +38,8 @@ static void on_trace(const char *label, struct interface *ifp, pim_addr src)
 		zlog_debug("%s: from %pPA on %s", label, &src, ifp->name);
 }
 
-static void recv_join(struct interface *ifp, struct pim_neighbor *neigh,
-		      uint16_t holdtime, pim_addr upstream, pim_sgaddr *sg,
-		      uint8_t source_flags)
+static void recv_join(struct interface *ifp, struct pim_neighbor *neigh, uint16_t holdtime,
+		      pim_addr upstream, pim_sgaddr *sg, uint8_t source_flags)
 {
 	struct pim_interface *pim_ifp = NULL;
 #if PIM_IPV == 6
@@ -55,7 +54,6 @@ static void recv_join(struct interface *ifp, struct pim_neighbor *neigh,
 			holdtime, &neigh->source_addr, ifp->name);
 
 	pim_ifp = ifp->info;
-	assert(pim_ifp);
 
 #if PIM_IPV == 6
 	if (pim_ifp->pim->embedded_rp.enable && pim_embedded_rp_extract(&sg->grp, &embedded_rp) &&
@@ -92,12 +90,16 @@ static void recv_join(struct interface *ifp, struct pim_neighbor *neigh,
 				  sg);
 			return;
 		}
+
 		/*
-		 * If the RP sent in the message is not
-		 * our RP for the group, drop the message
+		 * If the RP sent in the message is not our RP for the group,
+		 * drop the message - unless the user has specified the
+		 * allow-rp option, which means we skip this check and use our
+		 * RP instead, provided policy allows it. This latter bit is a
+		 * non-RFC-compliant option.
 		 */
 		rpf_addr = rp->rpf_addr;
-		if (pim_addr_cmp(sg->src, rpf_addr)) {
+		if (pim_addr_cmp(sg->src, rpf_addr) && !pim_is_rp_allowed(pim_ifp, &sg->src)) {
 			zlog_warn(
 				"%s: Specified RP(%pPAs) in join is different than our configured RP(%pPAs)",
 				__func__, &sg->src, &rpf_addr);
@@ -138,7 +140,6 @@ static void recv_prune(struct interface *ifp, struct pim_neighbor *neigh,
 			holdtime, &neigh->source_addr, ifp->name);
 
 	pim_ifp = ifp->info;
-	assert(pim_ifp);
 
 	++pim_ifp->pim_ifstat_prune_recv;
 
@@ -294,6 +295,8 @@ int pim_joinprune_recv(struct interface *ifp, struct pim_neighbor *neigh,
 
 		/* Scan joined sources */
 		for (source = 0; source < msg_num_joined_sources; ++source) {
+			struct prefix_sg psg;
+
 			addr_offset = pim_parse_addr_source(
 				&sg, &msg_source_flags, buf, pastend - buf);
 			if (addr_offset < 1) {
@@ -306,11 +309,21 @@ int pim_joinprune_recv(struct interface *ifp, struct pim_neighbor *neigh,
 			if (group_filtered || pim_is_group_filtered(pim_ifp, &sg.grp, &sg.src))
 				continue;
 
-			recv_join(ifp, neigh, msg_holdtime, msg_upstream_addr,
-				  &sg, msg_source_flags);
+			pim_sg_to_prefix(&sg, &psg);
+			if (!pim_filter_match(&pim_ifp->pim->join_filter, &psg, ifp)) {
+				if (PIM_DEBUG_PIM_TRACE)
+					zlog_debug("%s: SG%pPSG on interface %s filtered due to route-map",
+						   __func__, &psg, ifp->name);
+				continue;
+			}
+
+			recv_join(ifp, neigh, msg_holdtime, msg_upstream_addr, &sg,
+				  msg_source_flags);
 
 			if (pim_addr_is_any(sg.src)) {
-				starg_ch = pim_ifchannel_find(ifp, &sg);
+				struct pim_ifchannel *throwaway;
+
+				pim_ifchannel_find(ifp, &sg, &starg_ch, &throwaway);
 				if (starg_ch)
 					pim_ifchannel_set_star_g_join_state(
 						starg_ch, 0, 1);
@@ -326,6 +339,8 @@ int pim_joinprune_recv(struct interface *ifp, struct pim_neighbor *neigh,
 
 		/* Scan pruned sources */
 		for (source = 0; source < msg_num_pruned_sources; ++source) {
+			struct pim_ifchannel *throwaway;
+
 			addr_offset = pim_parse_addr_source(
 				&sg, &msg_source_flags, buf, pastend - buf);
 			if (addr_offset < 1) {
@@ -342,7 +357,7 @@ int pim_joinprune_recv(struct interface *ifp, struct pim_neighbor *neigh,
 			 * We need to retrieve the sg_ch after
 			 * we parse the prune.
 			 */
-			sg_ch = pim_ifchannel_find(ifp, &sg);
+			pim_ifchannel_find(ifp, &sg, &sg_ch, &throwaway);
 
 			if (!sg_ch)
 				continue;
@@ -350,13 +365,12 @@ int pim_joinprune_recv(struct interface *ifp, struct pim_neighbor *neigh,
 			/* (*,G) prune received */
 			for (ALL_LIST_ELEMENTS(sg_ch->sources, ch_node,
 					       nch_node, child)) {
-				if (PIM_IF_FLAG_TEST_S_G_RPT(child->flags)) {
+				if (pim_ifchannel_is_sg_rpt(child)) {
 					if (child->ifjoin_state
 					    == PIM_IFJOIN_PRUNE_PENDING_TMP)
 						event_cancel(&
 							child->t_ifjoin_prune_pending_timer);
 					event_cancel(&child->t_ifjoin_expiry_timer);
-					PIM_IF_FLAG_UNSET_S_G_RPT(child->flags);
 					child->ifjoin_state = PIM_IFJOIN_NOINFO;
 					delete_on_noinfo(child);
 				}
@@ -366,7 +380,6 @@ int pim_joinprune_recv(struct interface *ifp, struct pim_neighbor *neigh,
 			if (starg_ch && (msg_source_flags & PIM_RPT_BIT_MASK)
 			    && !(msg_source_flags & PIM_WILDCARD_BIT_MASK)) {
 				struct pim_upstream *up = sg_ch->upstream;
-				PIM_IF_FLAG_SET_S_G_RPT(sg_ch->flags);
 				if (up) {
 					if (PIM_DEBUG_PIM_TRACE)
 						zlog_debug(
@@ -559,7 +572,7 @@ int pim_graft_recv(struct interface *ifp, struct pim_neighbor *neigh, pim_addr s
  * Number of Joined Sources (2 bytes)
  * Number of Pruned Sources (2 bytes)
  *
- * This leads to a missleading representation from casual
+ * This leads to a misleading representation from casual
  * reading and making assumptions.  Be careful!
  *
  *   0                   1                   2                   3

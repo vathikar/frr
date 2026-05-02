@@ -689,8 +689,6 @@ void lspid_print(uint8_t *lsp_id, char *dest, size_t dest_len, char dynhost,
 /* Convert the lsp attribute bits to attribute string */
 static const char *lsp_bits2string(uint8_t lsp_bits, char *buf, size_t buf_size)
 {
-	char *pos = buf;
-
 	if (!lsp_bits)
 		return " none";
 
@@ -698,13 +696,10 @@ static const char *lsp_bits2string(uint8_t lsp_bits, char *buf, size_t buf_size)
 		return " error";
 
 	/* we only focus on the default metric */
-	pos += snprintf(pos, buf_size, "%d/",
-			ISIS_MASK_LSP_ATT_BITS(lsp_bits) ? 1 : 0);
-
-	pos += snprintf(pos, buf_size, "%d/",
-			ISIS_MASK_LSP_PARTITION_BIT(lsp_bits) ? 1 : 0);
-
-	snprintf(pos, buf_size, "%d", ISIS_MASK_LSP_OL_BIT(lsp_bits) ? 1 : 0);
+	snprintf(buf, buf_size, "%d/%d/%d",
+		 ISIS_MASK_LSP_ATT_BITS(lsp_bits) ? 1 : 0,
+		 ISIS_MASK_LSP_PARTITION_BIT(lsp_bits) ? 1 : 0,
+		 ISIS_MASK_LSP_OL_BIT(lsp_bits) ? 1 : 0);
 
 	return buf;
 }
@@ -833,7 +828,7 @@ static uint16_t lsp_rem_lifetime(struct isis_area *area, int level)
 
 	/* No jitter if the max refresh will be less than configure gen interval
 	 */
-	/* N.B. this calucation is acceptable since rem_lifetime is in
+	/* N.B. this calculation is acceptable since rem_lifetime is in
 	 * [332,65535] at
 	 * this point */
 	if (area->lsp_gen_interval[level - 1] > (rem_lifetime - 300))

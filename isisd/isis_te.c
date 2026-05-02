@@ -650,6 +650,9 @@ int isis_mpls_te_update(struct interface *ifp)
 	/* Update TE TLVs ... */
 	isis_link_params_update(circuit, ifp);
 
+	if (circuit->area && IS_MPLS_TE(circuit->area->mta))
+		isis_mpls_te_circuit_ip_update(circuit);
+
 	/* ... and LSP */
 	if (circuit->area && (IS_MPLS_TE(circuit->area->mta)
 #ifndef FABRICD
@@ -713,6 +716,7 @@ static struct ls_vertex *lsp_to_vertex(struct ls_ted *ted, struct isis_lsp *lsp)
 	struct ls_node *old, lnode = {};
 	struct isis_tlvs *tlvs;
 	const struct in_addr inaddr_any = { .s_addr = INADDR_ANY };
+	struct isis_area_address *addr;
 
 	/* Sanity check */
 	if (!ted || !lsp)
@@ -741,6 +745,15 @@ static struct ls_vertex *lsp_to_vertex(struct ls_ted *ted, struct isis_lsp *lsp)
 	/* Fulfill Link State Node information */
 	tlvs = lsp->tlvs;
 	if (tlvs) {
+		addr = (struct isis_area_address *)tlvs->area_addresses.head;
+		if (addr) {
+			lnode.isis_area_id_len = addr->len;
+			memcpy(lnode.isis_area_id, addr->addr, addr->len);
+			SET_FLAG(lnode.flags, LS_NODE_ISIS_AREA_ID);
+			if (addr->next)
+				zlog_warn("%s: Only one IS-IS Area ID is supported, ignoring others",
+					  __func__);
+		}
 		if (tlvs->te_router_id) {
 			IPV4_ADDR_COPY(&lnode.router_id, tlvs->te_router_id);
 			SET_FLAG(lnode.flags, LS_NODE_ROUTER_ID);

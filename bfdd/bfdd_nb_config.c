@@ -339,7 +339,7 @@ static int bfd_session_create(struct nb_cb_create_args *args, bool mhop, uint32_
 	case NB_EV_APPLY:
 		bs = args->resource->ptr;
 
-		/* Only attempt to registrate if freshly allocated. */
+		/* Only attempt to register if freshly allocated. */
 		if (bs->discrs.my_discr == 0 && bs_registrate(bs) == NULL)
 			return NB_ERR_RESOURCE;
 
@@ -479,7 +479,7 @@ int bfdd_bfd_profile_destroy(struct nb_cb_destroy_args *args)
 		return NB_OK;
 
 	bp = nb_running_unset_entry(args->dnode);
-	bfd_profile_free(bp);
+	bfd_profile_free(bp, false);
 
 	return NB_OK;
 }

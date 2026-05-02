@@ -305,7 +305,7 @@ struct rp_info *pim_rp_find_match_group(struct pim_instance *pim,
 
 	/*
 	 * So we have a non plist rp_info found in the lookup and no plists
-	 * at all to be choosen, return it!
+	 * at all to be chosen, return it!
 	 */
 	if (!best)
 		return rp_info;
@@ -436,7 +436,7 @@ void pim_upstream_update(struct pim_instance *pim, struct pim_upstream *up)
 	old_rpf.source_nexthop.interface = up->rpf.source_nexthop.interface;
 
 	rpf_result = pim_rpf_update(pim, up, &old_rpf, __func__);
-	if (rpf_result == PIM_RPF_FAILURE)
+	if (rpf_result == PIM_RPF_FAILURE && up->channel_oil)
 		pim_mroute_del(up->channel_oil, __func__);
 
 	/* update kernel multicast forwarding cache (MFC) */

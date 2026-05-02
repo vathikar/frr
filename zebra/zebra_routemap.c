@@ -1244,6 +1244,8 @@ char *zebra_get_import_table_route_map(afi_t afi, safi_t safi, uint32_t table)
 
 void zebra_add_import_table_route_map(afi_t afi, safi_t safi, const char *rmap_name, uint32_t table)
 {
+	if (zebra_import_table_routemap[afi][safi][table])
+		XFREE(MTYPE_ROUTE_MAP_NAME, zebra_import_table_routemap[afi][safi][table]);
 	zebra_import_table_routemap[afi][safi][table] = XSTRDUP(MTYPE_ROUTE_MAP_NAME, rmap_name);
 }
 

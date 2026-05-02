@@ -309,7 +309,7 @@ struct interface {
 	char ptm_enable; /* Should we look at ptm_status ? */
 	char ptm_status;
 
-/* Statistics fileds. */
+/* Statistics fields. */
 #ifdef HAVE_PROC_NET_DEV
 	struct if_stats stats;
 #endif /* HAVE_PROC_NET_DEV */
@@ -630,6 +630,7 @@ extern struct connected *connected_lookup_prefix(struct interface *ifp,
 						 const struct prefix *p);
 extern struct connected *connected_lookup_prefix_exact(struct interface *ifp,
 						       const struct prefix *p);
+extern bool if_has_connected_with_family(struct interface *ifp, int family);
 extern unsigned int connected_count_by_family(struct interface *ifp, int family);
 extern struct nbr_connected *nbr_connected_new(void);
 extern void nbr_connected_free(struct nbr_connected *connected);

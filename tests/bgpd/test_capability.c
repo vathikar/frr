@@ -617,7 +617,6 @@ static struct test_segment misc_segments[] =
 			},
 			2,
 			SHOULD_ERR,
-			-1,
 		},
 		{
 			"dyn-empty",
@@ -845,10 +844,10 @@ static void parse_test(struct peer *peer, struct test_segment *t, int type)
 		/* and it should leave getp as it found it */
 		assert(stream_get_getp(peer->connection->curr) == RANDOM_FUZZ);
 
-		ret = bgp_open_option_parse(peer, peer->connection, len, &capability);
+		ret = bgp_open_option_parse(peer->connection, len, &capability);
 		break;
 	case DYNCAP:
-		ret = bgp_capability_receive(peer->connection, peer, t->len);
+		ret = bgp_capability_receive(peer->connection, t->len);
 		break;
 	default:
 		printf("unknown type %u\n", type);

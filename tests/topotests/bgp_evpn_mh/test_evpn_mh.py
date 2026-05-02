@@ -24,7 +24,7 @@ import json
 import platform
 from functools import partial
 
-pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
+pytestmark = [pytest.mark.bgpd, pytest.mark.evpn, pytest.mark.pimd]
 
 # Save the Current Working Directory to find configuration files.
 CWD = os.path.dirname(os.path.realpath(__file__))
@@ -238,6 +238,18 @@ def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
         node.run("/sbin/bridge vlan del vid 1 untagged pvid dev %s" % bond_name)
         node.run("/sbin/bridge vlan add vid 1000 dev %s" % bond_name)
         node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
+
+
+def attach_bond_to_bridge(node, bond_name):
+    """
+    Re-attach an existing bond to the bridge with VLAN settings.
+    """
+    node.run("ip link set dev %s master bridge" % bond_name)
+    node.run("/sbin/bridge link set dev %s priority 8" % bond_name)
+    node.run("/sbin/bridge vlan del vid 1 dev %s" % bond_name)
+    node.run("/sbin/bridge vlan del vid 1 untagged pvid dev %s" % bond_name)
+    node.run("/sbin/bridge vlan add vid 1000 dev %s" % bond_name)
+    node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
 
 
 def config_mcast_tunnel_termination_device(node):
@@ -765,6 +777,117 @@ def test_evpn_df():
     # tgen.mininet_cli()
 
 
+def check_remote_es_vtep_present(dut, esi, vtep_ip):
+    """
+    Return None if vtep_ip is found in the ES VTEP list, else error string.
+    """
+    bgp_es = dut.vtysh_cmd(f"show bgp l2vp evpn es {esi} json")
+    es = json.loads(bgp_es)
+
+    if not es:
+        return f"esi {esi} not found"
+
+    vtep_ips = []
+    for vtep in es.get("vteps", []):
+        vtep_ips.append(vtep["vtep_ip"])
+
+    if vtep_ip in vtep_ips:
+        return None
+
+    return f"vtep {vtep_ip} not in ES {esi} vteps {vtep_ips}"
+
+
+def check_remote_es_vtep_absent(dut, esi, vtep_ip):
+    """
+    Return None if vtep_ip is NOT in the ES VTEP list, else error string.
+    """
+    bgp_es = dut.vtysh_cmd(f"show bgp l2vp evpn es {esi} json")
+    es = json.loads(bgp_es)
+
+    if not es:
+        # ES gone entirely means vtep is absent
+        return None
+
+    vtep_ips = []
+    for vtep in es.get("vteps", []):
+        vtep_ips.append(vtep["vtep_ip"])
+
+    if vtep_ip not in vtep_ips:
+        return None
+
+    return f"stale vtep {vtep_ip} still in ES {esi} vteps {vtep_ips}"
+
+
+def test_evpn_vtep_change():
+    """
+    Test that changing the originator VTEP IP on a remote TOR removes the
+    stale VTEP from ES tables on the receiver.
+
+    torm21 has two loopback addresses: 192.168.100.17 (primary) and
+    192.168.100.117 (secondary). The VTEP is switched from primary to
+    secondary and back to verify stale VTEP cleanup.
+
+    1. Add secondary loopback on torm21.
+    2. Verify initial ES VTEP list is correct on torm11.
+    3. Switch VTEP from primary to secondary.
+    4. Verify new VTEP appears and old VTEP is removed.
+    5. Switch VTEP back to primary and verify convergence.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut = tgen.gears["torm11"]
+    remote_tor = tgen.gears["torm21"]
+    esi = host_es_map.get("hostd21")
+    primary_vtep = "192.168.100.17"
+    secondary_vtep = "192.168.100.117"
+
+    # 1. Add secondary loopback address on torm21
+    remote_tor.run(f"ip addr add {secondary_vtep}/32 dev lo")
+
+    # 2. Verify primary VTEP is present initially
+    test_fn = partial(check_remote_es_vtep_present, dut, esi, primary_vtep)
+    _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+    assertmsg = f"torm11: primary VTEP {primary_vtep} not found in ES {esi} initially"
+    assert result is None, assertmsg
+
+    # 3. Switch VTEP from primary to secondary (vxlan local IP change
+    #    triggers zebra to update ES originator IP and BGP re-advertises)
+    remote_tor.run(f"ip link set dev vx-1000 type vxlan local {secondary_vtep}")
+
+    # 4. Verify new VTEP appears and old VTEP is removed
+    test_fn = partial(check_remote_es_vtep_present, dut, esi, secondary_vtep)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = (
+        f"torm11: secondary VTEP {secondary_vtep} not found in ES {esi} after switch"
+    )
+    assert result is None, assertmsg
+
+    test_fn = partial(check_remote_es_vtep_absent, dut, esi, primary_vtep)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = f"torm11: stale VTEP {primary_vtep} still in ES {esi} after switch"
+    assert result is None, assertmsg
+
+    # 5. Switch VTEP back to primary
+    remote_tor.run(f"ip link set dev vx-1000 type vxlan local {primary_vtep}")
+
+    # Verify restored
+    test_fn = partial(check_remote_es_vtep_present, dut, esi, primary_vtep)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = f"torm11: primary VTEP {primary_vtep} not restored in ES {esi}"
+    assert result is None, assertmsg
+
+    test_fn = partial(check_remote_es_vtep_absent, dut, esi, secondary_vtep)
+    _, result = topotest.run_and_expect(test_fn, None, count=30, wait=3)
+    assertmsg = f"torm11: stale VTEP {secondary_vtep} still in ES {esi} after restore"
+    assert result is None, assertmsg
+
+    # Cleanup: remove secondary loopback
+    remote_tor.run(f"ip addr del {secondary_vtep}/32 dev lo")
+
+
 def check_protodown_rc(dut, protodown_rc):
     """
     check if specified protodown reason code is set
@@ -857,6 +980,53 @@ def test_evpn_access_vlan_vni_count():
     if output and "VLAN" in output:
         assertmsg = "VNI-count column missing in 'show evpn access-vlan' output"
         assert "VNI-count" in output, assertmsg
+
+
+def test_evpn_es_config_without_bridge():
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    dut = tgen.gears["torm11"]
+    bond_name = "hostbond1"
+
+    try:
+        # Remove bond from bridge, then apply ES config on the interface.
+        dut.run(f"ip link set dev {bond_name} nomaster")
+
+        def _bond_detached():
+            out = dut.run(f"ip -o link show dev {bond_name}")
+            return None if "master bridge" not in out else "bond still bridged"
+
+        test_fn = partial(_bond_detached)
+        _, result = topotest.run_and_expect(test_fn, None, count=20, wait=3)
+        assertmsg = f'"{dut.name}" bond still has bridge master'
+        assert result is None, assertmsg
+
+        dut.vtysh_cmd(
+            f"""
+            conf
+              interface {bond_name}
+                evpn mh es-id 3883244
+                evpn mh es-sys-mac 02:00:5e:9e:e2:0d
+            """
+        )
+
+        status = dut.check_router_running()
+        assertmsg = f"Router {dut.name} has issues after ES config: {status}"
+        assert not status, assertmsg
+    finally:
+        # Restore original bond and EVPN MH config.
+        attach_bond_to_bridge(dut, bond_name)
+        dut.vtysh_cmd(
+            f"""
+            conf
+              interface {bond_name}
+                evpn mh es-id 1
+                evpn mh es-sys-mac 44:38:39:ff:ff:01
+            """
+        )
 
 
 if __name__ == "__main__":

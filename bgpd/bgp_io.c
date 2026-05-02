@@ -200,7 +200,8 @@ static int read_ibuf_work(struct peer_connection *connection)
 	pktsize = ntohs(pktsize);
 
 	/* if this fails we are seriously screwed */
-	assert(pktsize <= connection->peer->max_packet_size);
+	if (pktsize > connection->peer->max_packet_size)
+		return -EBADMSG;
 
 	/*
 	 * If we have that much data, chuck it into its own
@@ -308,8 +309,9 @@ done:
 		return;
 	}
 
-	event_add_read(fpt->master, bgp_process_reads, connection,
-		       connection->fd, &connection->t_read);
+	if (ret != -ENOMEM)
+		event_add_read(fpt->master, bgp_process_reads, connection, connection->fd,
+			       &connection->t_read);
 	if (added_pkt) {
 		frr_with_mutex (&bm->peer_connection_mtx) {
 			if (!peer_connection_fifo_member(&bm->connection_fifo, connection))
@@ -495,7 +497,7 @@ done : {
 	if (update_last_write) {
 		atomic_store_explicit(&peer->last_write, now,
 				      memory_order_relaxed);
-		peer->last_sendq_ok = now;
+		atomic_store_explicit(&connection->last_sendq_ok, now, memory_order_relaxed);
 	}
 }
 
@@ -597,7 +599,7 @@ static bool validate_header(struct peer_connection *connection)
 		return false;
 
 	if (memcmp(m_correct, m_rx, BGP_MARKER_SIZE) != 0) {
-		bgp_notify_io_invalid(peer, BGP_NOTIFY_HEADER_ERR,
+		bgp_notify_io_invalid(connection, BGP_NOTIFY_HEADER_ERR,
 				      BGP_NOTIFY_HEADER_NOT_SYNC, NULL, 0);
 		return false;
 	}
@@ -618,7 +620,7 @@ static bool validate_header(struct peer_connection *connection)
 			zlog_debug("%s unknown message type 0x%02x", peer->host,
 				   type);
 
-		bgp_notify_io_invalid(peer, BGP_NOTIFY_HEADER_ERR,
+		bgp_notify_io_invalid(connection, BGP_NOTIFY_HEADER_ERR,
 				      BGP_NOTIFY_HEADER_BAD_MESTYPE, &type, 1);
 		return false;
 	}
@@ -644,9 +646,8 @@ static bool validate_header(struct peer_connection *connection)
 
 		uint16_t nsize = htons(size);
 
-		bgp_notify_io_invalid(peer, BGP_NOTIFY_HEADER_ERR,
-				      BGP_NOTIFY_HEADER_BAD_MESLEN,
-				      (unsigned char *)&nsize, 2);
+		bgp_notify_io_invalid(connection, BGP_NOTIFY_HEADER_ERR,
+				      BGP_NOTIFY_HEADER_BAD_MESLEN, (unsigned char *)&nsize, 2);
 		return false;
 	}
 

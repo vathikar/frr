@@ -33,6 +33,13 @@ extern struct debug mgmt_debug_txn;
 #define MGMT_DEBUG_FE_CHECK() DEBUG_MODE_CHECK(&mgmt_debug_fe, DEBUG_MODE_ALL)
 #define MGMT_DEBUG_TXN_CHECK() DEBUG_MODE_CHECK(&mgmt_debug_tx, DEBUG_MODE_ALL)
 
+/* The first 1000 session IDs are reserved for backend clients IDs */
+#define MGMT_FE_SESSION_ID_MIN 1001
+#define MGMT_FE_SESSION_ID_MAX UINTPTR_MAX
+
+#define MGMT_BE_CLIENT_TO_SESSION_ID(client_id)	 ((client_id) + 1)
+#define MGMT_FE_SESSION_TO_CLIENT_ID(session_id) (assert((session_id) > 0), ((session_id)-1))
+
 struct mgmt_txn;
 
 /*
@@ -111,5 +118,12 @@ extern void vty_mgmt_resume_response(struct vty *vty, int ret);
 extern int vty_mgmt_send_config_data(struct vty *vty, const char *xpath_base, bool implicit_commit);
 extern int vty_mgmt_send_rpc_req(struct vty *vty, LYD_FORMAT request_type, const char *xpath,
 				 const char *data);
+
+// clang-format off
+#ifdef _FRR_ATTRIBUTE_PRINTFRR
+#pragma FRR printfrr_ext "%pMBI" (mgmt_be_client_id_t *)
+#pragma FRR printfrr_ext "%pMBM" (uint64_t *)
+#endif
+// clang-format on
 
 #endif /* _FRR_MGMTD_H */

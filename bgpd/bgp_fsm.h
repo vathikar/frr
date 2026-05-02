@@ -33,8 +33,8 @@ enum bgp_fsm_state_progress {
 		if (BGP_SUPPRESS_FIB_ENABLED(peer->bgp) &&                            \
 		    PEER_ROUTE_ADV_DELAY(peer))                                       \
 			event_add_timer_msec(bm->master, (F), connection,             \
-					     (BGP_DEFAULT_UPDATE_ADVERTISEMENT_TIME * \
-					      1000),                                  \
+					     bgp_suppress_fib_get_adv_delay(      \
+						     peer->bgp),                  \
 					     (T));                                    \
 		else                                                                  \
 			event_add_timer_msec(bm->master, (F), connection, 0,          \
@@ -170,4 +170,5 @@ const char *print_global_gr_cmd(enum global_gr_command gl_gr_cmd);
 int bgp_peer_connection_reg_with_nht(struct peer_connection *connection);
 void bgp_gr_check_path_select(struct bgp *bgp, afi_t afi, safi_t safi);
 void bgp_gr_start_all_deferral_timers(struct bgp *bgp);
+extern bool bgp_rpki_cache_connected(struct bgp *bgp);
 #endif /* _QUAGGA_BGP_FSM_H */

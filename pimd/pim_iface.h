@@ -170,6 +170,10 @@ struct pim_interface {
 	bool activeactive;
 	bool am_i_dr;
 
+	/* Turn on allow-rp for this interface */
+	bool allow_rp;
+	char *allow_rp_plist;
+
 	int64_t pim_ifstat_start; /* start timestamp for stats */
 	uint64_t pim_ifstat_bsm_rx;
 	uint64_t pim_ifstat_bsm_tx;
@@ -207,6 +211,14 @@ struct pim_interface {
 		char *profile;
 	} bfd_config;
 };
+
+/* Last member query count is robustness variable unless overridden */
+static inline int if_gm_last_member_query_count(const struct pim_interface *pim_interface)
+{
+	return (pim_interface->gm_last_member_query_count != 0)
+		       ? pim_interface->gm_last_member_query_count
+		       : pim_interface->gm_default_robustness_variable;
+}
 
 /*
  * if default_holdtime is set (>= 0), use it;

@@ -2346,7 +2346,7 @@ bool zapi_srv6_sid_notify_decode(struct stream *s, struct srv6_sid_ctx *ctx,
 				 char **p_locator_name)
 {
 	uint32_t f, wf;
-	uint16_t len;
+	uint16_t len = 0;
 	static char locator_name[SRV6_LOCNAME_SIZE];
 
 	STREAM_GET(note, s, sizeof(*note));
@@ -2752,7 +2752,7 @@ stream_failure:
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |  Link Layer Type                                              |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |  Harware Address Length                                       |
+ * |  Hardware Address Length                                      |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |  Hardware Address      if HW length different from 0          |
  * |   ...                  max INTERFACE_HWADDR_MAX               |
@@ -3351,7 +3351,7 @@ static int zclient_read_sync_response(struct zclient *zclient,
 	uint8_t version;
 	vrf_id_t vrf_id;
 	uint16_t cmd;
-	fd_set readfds;
+	struct pollfd pfd;
 	int ret;
 
 	ret = 0;
@@ -3360,11 +3360,26 @@ static int zclient_read_sync_response(struct zclient *zclient,
 		s = zclient->ibuf;
 		stream_reset(s);
 
-		/* wait until response arrives */
-		FD_ZERO(&readfds);
-		FD_SET(zclient->sock, &readfds);
-		select(zclient->sock + 1, &readfds, NULL, NULL, NULL);
-		if (!FD_ISSET(zclient->sock, &readfds))
+		/* wait until response arrives (poll avoids FD_SETSIZE limit) */
+		pfd.fd = zclient->sock;
+		pfd.events = POLLIN | POLLHUP | POLLERR;
+		if (poll(&pfd, 1, -1) < 0) {
+			if (errno == EINTR)
+				continue;
+			flog_err(EC_LIB_ZAPI_SOCKET, "%s: poll failed: %s",
+				 __func__, safe_strerror(errno));
+			return -1;
+		}
+		if (pfd.revents & POLLNVAL) {
+			flog_err(EC_LIB_ZAPI_SOCKET, "%s: invalid zclient socket",
+				 __func__);
+			return -1;
+		}
+		/*
+		 * Treat POLLHUP/POLLERR as readable so read can surface the error
+		 * (matches lib/event.c pattern, avoids busy-spin on socket error)
+		 */
+		if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR)))
 			continue;
 		/* read response */
 		ret = zclient_read_header(s, zclient->sock, &size, &marker,

@@ -177,7 +177,7 @@ static bool pim_msdp_sa_upstream_add_ok(struct pim_msdp_sa *sa,
 	return true;
 }
 
-/* Upstream add evaluation needs to happen everytime -
+/* Upstream add evaluation needs to happen every time -
  * 1. Peer reference is added or removed.
  * 2. The RP for a group changes.
  * 3. joinDesired for the associated (*, G) changes
@@ -411,7 +411,7 @@ void pim_msdp_sa_ref(struct pim_instance *pim, struct pim_msdp_peer *mp,
 		pim_msdp_sa_peer_ip_set(sa, mp, rp);
 		/* start/re-start the state timer to prevent cache expiry */
 		pim_msdp_sa_state_timer_setup(sa, true /* start */);
-		/* We re-evaluate SA "SPT-trigger" everytime we hear abt it from
+		/* We re-evaluate SA "SPT-trigger" every time we hear abt it from
 		 * a
 		 * peer. XXX: If this becomes too much of a periodic overhead we
 		 * can make it event based */
@@ -446,7 +446,7 @@ void pim_msdp_sa_ref(struct pim_instance *pim, struct pim_msdp_peer *mp,
  */
 static bool pim_msdp_sa_local_add_ok(struct pim_upstream *up)
 {
-	struct pim_instance *pim = up->channel_oil->pim;
+	struct pim_instance *pim = up->pim;
 
 	if (!(pim->msdp.flags & PIM_MSDPF_ENABLE)) {
 		return false;
@@ -554,7 +554,7 @@ static void pim_msdp_sa_local_del_on_up_del(struct pim_instance *pim,
  */
 void pim_msdp_sa_local_update(struct pim_upstream *up)
 {
-	struct pim_instance *pim = up->channel_oil->pim;
+	struct pim_instance *pim = up->pim;
 
 	if (pim_msdp_sa_local_add_ok(up)) {
 		pim_msdp_sa_local_add(pim, &up->sg);
@@ -609,7 +609,7 @@ void pim_msdp_i_am_rp_changed(struct pim_instance *pim)
 			 * contents after */
 			pim_msdp_sa_deref(sa, PIM_MSDP_SAF_LOCAL);
 		} else {
-			/* if the souce is still active check if we can
+			/* if the source is still active check if we can
 			 * influence SPT */
 			pim_msdp_sa_upstream_update(sa, NULL /* xg_up */,
 						    "rp-change");
@@ -1101,7 +1101,7 @@ static void pim_msdp_peer_active_connect(struct pim_msdp_peer *mp)
 		break;
 
 	case connect_success:
-		/* connect was sucessful move to established */
+		/* connect was successful move to established */
 		pim_msdp_peer_established(mp);
 		break;
 
@@ -1112,7 +1112,7 @@ static void pim_msdp_peer_active_connect(struct pim_msdp_peer *mp)
 		PIM_MSDP_PEER_READ_ON(mp);
 		/* also restart connect-retry timer to reset the socket if
 		 * connect is
-		 * not sucessful */
+		 * not successful */
 		pim_msdp_peer_cr_timer_setup(mp, true /* start */);
 		break;
 	}
@@ -1180,7 +1180,7 @@ struct pim_msdp_peer *pim_msdp_peer_add(struct pim_instance *pim,
 
 	mp->pim = pim;
 	mp->peer = *peer;
-	pim_inet4_dump("<peer?>", mp->peer, mp->key_str, sizeof(mp->key_str));
+	snprintfrr(mp->key_str, sizeof(mp->key_str), "%pI4s", &mp->peer);
 	mp->local = *local;
 	if (mesh_group_name) {
 		mp->mesh_group_name =
@@ -1437,7 +1437,6 @@ int pim_msdp_config_write(struct pim_instance *pim, struct vty *vty)
 	struct pim_msdp_mg *mg;
 	struct listnode *mbrnode;
 	struct pim_msdp_mg_mbr *mbr;
-	char src_str[INET_ADDRSTRLEN];
 	int count = 0;
 
 	if (pim->msdp.hold_time != PIM_MSDP_PEER_HOLD_TIME ||
@@ -1461,10 +1460,8 @@ int pim_msdp_config_write(struct pim_instance *pim, struct vty *vty)
 
 	SLIST_FOREACH (mg, &pim->msdp.mglist, mg_entry) {
 		if (mg->src_ip.s_addr != INADDR_ANY) {
-			pim_inet4_dump("<src?>", mg->src_ip, src_str,
-				       sizeof(src_str));
-			vty_out(vty, " msdp mesh-group %s source %s\n",
-				mg->mesh_group_name, src_str);
+			vty_out(vty, " msdp mesh-group %s source %pI4s\n", mg->mesh_group_name,
+				&mg->src_ip);
 			++count;
 		}
 
@@ -1652,7 +1649,7 @@ struct pim_msdp_mg_mbr *pim_msdp_mg_mbr_add(struct pim_instance *pim,
 static void pim_upstream_msdp_reg_timer(struct event *t)
 {
 	struct pim_upstream *up = EVENT_ARG(t);
-	struct pim_instance *pim = up->channel_oil->pim;
+	struct pim_instance *pim = up->pim;
 
 	/* source is no longer active - pull the SA from MSDP's cache */
 	pim_msdp_sa_local_del(pim, &up->sg);

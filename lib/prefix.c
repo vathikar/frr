@@ -132,6 +132,8 @@ const char *afi2str_lower(afi_t afi)
 		return "ipv6";
 	case AFI_L2VPN:
 		return "l2vpn";
+	case AFI_BGP_LS:
+		return "bgp-ls";
 	case AFI_MAX:
 	case AFI_UNSPEC:
 		return "bad-value";
@@ -150,6 +152,8 @@ const char *afi2str(afi_t afi)
 		return "IPv6";
 	case AFI_L2VPN:
 		return "l2vpn";
+	case AFI_BGP_LS:
+		return "BGP-LS";
 	case AFI_MAX:
 	case AFI_UNSPEC:
 		return "bad-value";
@@ -176,6 +180,8 @@ const char *safi2str(safi_t safi)
 		return "labeled-unicast";
 	case SAFI_FLOWSPEC:
 		return "flowspec";
+	case SAFI_BGP_LS:
+		return "bgp-ls";
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
 		return "unknown";
@@ -598,7 +604,7 @@ int str2prefix_ipv4(const char *str, struct prefix_ipv4 *p)
 {
 	int ret;
 	int plen;
-	char *pnt;
+	const char *pnt;
 	char *cp;
 
 	/* Find slash inside string. */
@@ -643,7 +649,7 @@ int str2prefix_eth(const char *str, struct prefix_eth *p)
 {
 	int ret = 0;
 	int plen = 48;
-	char *pnt;
+	const char *pnt;
 	char *cp = NULL;
 	const char *str_addr = str;
 	unsigned int a[6];
@@ -768,7 +774,7 @@ void prefix_ipv6_free(struct prefix_ipv6 **p)
 /* If given string is valid return 1 else return 0 */
 int str2prefix_ipv6(const char *str, struct prefix_ipv6 *p)
 {
-	char *pnt;
+	const char *pnt;
 	char *cp;
 	int ret;
 
@@ -1200,23 +1206,6 @@ static ssize_t prefixhost2str(struct fbuf *fbuf, union prefixconstptr pu)
 	default:
 		return bprintfrr(fbuf, "{prefix.af=%dPF}", p->family);
 	}
-}
-
-void prefix_mcast_inet4_dump(const char *onfail, struct in_addr addr,
-		char *buf, int buf_size)
-{
-	int save_errno = errno;
-
-	if (addr.s_addr == INADDR_ANY)
-		strlcpy(buf, "*", buf_size);
-	else {
-		if (!inet_ntop(AF_INET, &addr, buf, buf_size)) {
-			if (onfail)
-				snprintf(buf, buf_size, "%s", onfail);
-		}
-	}
-
-	errno = save_errno;
 }
 
 const char *prefix_sg2str(const struct prefix_sg *sg, char *sg_str)

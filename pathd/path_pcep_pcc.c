@@ -193,20 +193,9 @@ void pcep_pcc_finalize(struct ctrl_state *ctrl_state,
 		pcc_state->originator = NULL;
 	}
 
-	if (pcc_state->t_reconnect != NULL) {
-		event_cancel(&pcc_state->t_reconnect);
-		pcc_state->t_reconnect = NULL;
-	}
-
-	if (pcc_state->t_update_best != NULL) {
-		event_cancel(&pcc_state->t_update_best);
-		pcc_state->t_update_best = NULL;
-	}
-
-	if (pcc_state->t_session_timeout != NULL) {
-		event_cancel(&pcc_state->t_session_timeout);
-		pcc_state->t_session_timeout = NULL;
-	}
+	pcep_thread_cancel_timer(&pcc_state->t_reconnect);
+	pcep_thread_cancel_timer(&pcc_state->t_update_best);
+	pcep_thread_cancel_timer(&pcc_state->t_session_timeout);
 
 	XFREE(MTYPE_PCEP, pcc_state);
 }
@@ -340,8 +329,12 @@ void pcep_pcc_reconnect(struct ctrl_state *ctrl_state,
 
 int pcep_pcc_enable(struct ctrl_state *ctrl_state, struct pcc_state *pcc_state)
 {
-	assert(pcc_state->status == PCEP_PCC_DISCONNECTED);
-	assert(pcc_state->sess == NULL);
+	if ((pcc_state->status != PCEP_PCC_DISCONNECTED) || (pcc_state->sess != NULL)) {
+		flog_warn(EC_PATH_PCEP_RECOVERABLE_INTERNAL_ERROR,
+			  "skipping connection to PCE %pIA:%d due to invalid state",
+			  &pcc_state->pce_opts->addr, pcc_state->pce_opts->port);
+		return 0;
+	}
 
 	if (pcc_state->t_reconnect != NULL) {
 		event_cancel(&pcc_state->t_reconnect);
@@ -382,8 +375,8 @@ int pcep_pcc_enable(struct ctrl_state *ctrl_state, struct pcc_state *pcc_state)
 		}
 	}
 
-	/* Even if the maximum retries to try to have all the familly addresses
-	 * have been spent, we still need the one for the transport familly */
+	/* Even if the maximum retries to try to have all the family addresses
+	 * have been spent, we still need the one for the transport family */
 	if (pcc_state->pcc_addr_tr.ipa_type == IPADDR_NONE) {
 		flog_warn(EC_PATH_PCEP_MISSING_SOURCE_ADDRESS,
 			  "skipping connection to PCE %pIA:%d due to missing PCC address",
@@ -472,7 +465,7 @@ void pcep_pcc_sync_path(struct ctrl_state *ctrl_state,
 	}
 
 	/* Synchronize the path if the PCE supports LSP updates and the
-	 * endpoint address familly is supported */
+	 * endpoint address family is supported */
 	if (pcc_state->caps.is_stateful) {
 		if (filter_path(pcc_state, path)) {
 			PCEP_DEBUG("%s Synchronizing path %s", pcc_state->tag,
@@ -542,7 +535,7 @@ void pcep_pcc_send_report(struct ctrl_state *ctrl_state,
 
 	/* ODL and Cisco requires the first reported
 	 * LSP to have a DOWN status, the later status changes
-	 * will be comunicated through hook calls.
+	 * will be communicated through hook calls.
 	 */
 	enum pcep_lsp_operational_status real_status = path->status;
 	path->status = PCEP_LSP_OPERATIONAL_DOWN;
@@ -1364,7 +1357,7 @@ void handle_pcep_comp_reply(struct ctrl_state *ctrl_state,
 	/* Cancel the computation request timeout */
 	pcep_thread_cancel_timer(&req->t_retry);
 
-	/* Transfer relevent metadata from the request to the response */
+	/* Transfer relevant metadata from the request to the response */
 	path->nbkey = req->path->nbkey;
 	path->plsp_id = req->path->plsp_id;
 	path->type = req->path->type;
@@ -1733,7 +1726,7 @@ void cancel_comp_request(struct ctrl_state *ctrl_state,
 	struct pcep_message *msg;
 
 	if (req->was_sent) {
-		/* TODO: Send a computation request cancelation
+		/* TODO: Send a computation request cancellation
 		 * notification to the PCE */
 		pcep_thread_cancel_timer(&req->t_retry);
 	}
@@ -1789,7 +1782,7 @@ void lookup_plspid(struct pcc_state *pcc_state, struct path *path)
 			nbkey_mapping->plspid = pcc_state->next_plspid;
 			nbkey_map_add(&pcc_state->nbkey_map, nbkey_mapping);
 			pcc_state->next_plspid++;
-			// FIXME: Send some error to the PCE isntead of crashing
+			// FIXME: Send some error to the PCE instead of crashing
 			assert(pcc_state->next_plspid <= 1048576);
 		}
 		path->plsp_id = plspid_mapping->plspid;

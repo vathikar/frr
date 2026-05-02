@@ -292,7 +292,7 @@ static int ripng_recv_packet(int sock, uint8_t *buf, int bufsize,
 		}
 	}
 
-	/* Hoplimit check shold be done when destination address is
+	/* Hoplimit check should be done when destination address is
 	   multicast address. */
 	if (!IN6_IS_ADDR_MULTICAST(&dst))
 		*hoplimit = -1;
@@ -347,7 +347,7 @@ static void ripng_nexthop_rte(struct rte *rte, struct sockaddr_in6 *from,
 
 	/* RFC2080 2.1.1 Next Hop:
 	 The route tag and prefix length in the next hop RTE must be
-	 set to zero on sending and ignored on receiption.  */
+	 set to zero on sending and ignored on reception.  */
 	if (ntohs(rte->tag) != 0)
 		zlog_warn(
 			"RIPng nexthop RTE with non zero tag value %" ROUTE_TAG_PRI
@@ -826,7 +826,7 @@ static void ripng_route_process(struct rte *rte, struct sockaddr_in6 *from,
 	}
 
 	/* Once the entry has been validated, update the metric by
-	 * adding the cost of the network on wich the message
+	 * adding the cost of the network on which the message
 	 * arrived. If the result is greater than infinity, use infinity
 	 * (RFC2453 Sec. 3.9.2)
 	 **/
@@ -1138,11 +1138,18 @@ static void ripng_response_process(struct ripng_packet *packet, int size,
 				   struct sockaddr_in6 *from,
 				   struct interface *ifp, int hoplimit)
 {
-	struct ripng_interface *ri = ifp->info;
-	struct ripng *ripng = ri->ripng;
+	struct ripng_interface *ri;
+	struct ripng *ripng;
 	caddr_t lim;
 	struct rte *rte;
 	struct ripng_nexthop nexthop;
+
+	/* Check RIPng process is enabled on this interface. */
+	ri = ifp->info;
+	if (ri == NULL || !ri->running)
+		return;
+
+	ripng = ri->ripng;
 
 	/* RFC2080 2.4.2  Response Messages:
 	 The Response must be ignored if it is not from the RIPng port.  */
@@ -1252,7 +1259,7 @@ static void ripng_response_process(struct ripng_packet *packet, int size,
 			continue;
 		}
 
-		/* Vincent: XXX Should we compute the direclty reachable nexthop
+		/* Vincent: XXX Should we compute the directly reachable nexthop
 		 * for our RIPng network ?
 		 **/
 
@@ -1274,7 +1281,7 @@ static void ripng_request_process(struct ripng_packet *packet, int size,
 	struct ripng_info *rinfo;
 	struct ripng_interface *ri;
 
-	/* Does not reponse to the requests on the loopback interfaces */
+	/* Does not response to the requests on the loopback interfaces */
 	if (if_is_loopback(ifp))
 		return;
 
@@ -1323,18 +1330,23 @@ static void ripng_request_process(struct ripng_packet *packet, int size,
 		p.family = AF_INET6;
 
 		for (; ((caddr_t)rte) < lim; rte++) {
+			rinfo = NULL;
+
 			p.prefix = rte->addr;
 			p.prefixlen = rte->prefixlen;
 			apply_mask_ipv6(&p);
 
-			rp = agg_node_lookup(ripng->table, (struct prefix *)&p);
+			rte->metric = RIPNG_METRIC_INFINITY;
 
+			rp = agg_node_lookup(ripng->table, (struct prefix *)&p);
 			if (rp) {
-				rinfo = ripng_info_list_first(rp->info);
-				rte->metric = rinfo->metric;
+				if (rp->info)
+					rinfo = ripng_info_list_first(rp->info);
+				if (rinfo)
+					rte->metric = rinfo->metric;
+
 				agg_unlock_node(rp);
-			} else
-				rte->metric = RIPNG_METRIC_INFINITY;
+			}
 		}
 		packet->command = RIPNG_RESPONSE;
 
@@ -1359,7 +1371,7 @@ static void ripng_read(struct event *event)
 	assert(ripng->sock >= 0);
 
 	/* Fetch event data and set read pointer to empty for event
-	   managing.  `sock' sould be same as ripng->sock. */
+	   managing.  `sock' should be same as ripng->sock. */
 	sock = EVENT_FD(event);
 
 	/* Add myself to the next event. */
@@ -1372,6 +1384,12 @@ static void ripng_read(struct event *event)
 	if (len < 0) {
 		zlog_warn("RIPng recvfrom failed (VRF %s): %s.",
 			  ripng->vrf_name, safe_strerror(errno));
+		return;
+	}
+
+	if (len < RIPNG_MIN_PACKET_SIZE || len > RIPNG_MAX_PACKET_SIZE) {
+		zlog_warn("RIPng invalid packet size %d from %pI6 (VRF %s)",
+			  len, &from.sin6_addr, ripng->vrf_name);
 		return;
 	}
 
@@ -1714,7 +1732,7 @@ void ripng_output_process(struct interface *ifp, struct sockaddr_in6 *to,
 							.metric;
 				} else {
 					/* If the route is not connected or
-					   localy generated
+					   locally generated
 					   one, use default-metric value */
 					if (rinfo->type != ZEBRA_ROUTE_RIPNG &&
 					    rinfo->type !=

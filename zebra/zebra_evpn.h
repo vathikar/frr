@@ -9,24 +9,20 @@
 #ifndef _ZEBRA_EVPN_H
 #define _ZEBRA_EVPN_H
 
-#include <zebra.h>
+#include "lib/linklist.h"
+#include "lib/hash.h"
+#include "lib/bitfield.h"
+#include "lib/prefix.h"
+#include "lib/json.h"
+#include "lib/if.h"
 
-#include "if.h"
-#include "linklist.h"
-#include "bitfield.h"
-
-#include "zebra/zebra_l2.h"
 #include "zebra/interface.h"
-#include "zebra/zebra_vxlan.h"
 #include "zebra/zebra_vxlan_if.h"
+#include "zebra/zebra_evpn_base.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-RB_HEAD(zebra_es_evi_rb_head, zebra_evpn_es_evi);
-RB_PROTOTYPE(zebra_es_evi_rb_head, zebra_evpn_es_evi, rb_node,
-	     zebra_es_evi_rb_cmp);
 
 /* Private Structure to pass callback data for hash iterator */
 struct zebra_evpn_show {
@@ -60,64 +56,6 @@ struct zebra_vtep {
 	uint64_t gr_refresh_time;
 };
 
-/*
- * VNI hash table
- *
- * Contains information pertaining to a VNI:
- * - the list of remote VTEPs (with this VNI)
- */
-struct zebra_evpn {
-	/* VNI - key */
-	vni_t vni;
-
-	/* ES flags */
-	uint32_t flags;
-#define ZEVPN_READY_FOR_BGP (1 << 0) /* ready to be sent to BGP */
-
-	/* Corresponding Bridge information */
-	vlanid_t vid;
-	struct interface *bridge_if;
-
-	/* Flag for advertising gw macip */
-	uint8_t advertise_gw_macip;
-
-	/* Flag for advertising svi macip */
-	uint8_t advertise_svi_macip;
-
-	/* Flag for advertising gw macip */
-	uint8_t advertise_subnet;
-
-	/* Corresponding VxLAN interface. */
-	struct interface *vxlan_if;
-
-	/* Corresponding SVI interface. */
-	struct interface *svi_if;
-
-	/* List of remote VTEPs */
-	struct zebra_vtep *vteps;
-
-	/* Local IP */
-	struct ipaddr local_vtep_ip;
-
-	/* PIM-SM MDT group for BUM flooding */
-	struct in_addr mcast_grp;
-
-	/* tenant VRF, if any */
-	vrf_id_t vrf_id;
-
-	/* List of local or remote MAC */
-	struct hash *mac_table;
-
-	/* List of local or remote neighbors (MAC+IP) */
-	struct hash *neigh_table;
-
-	/* RB tree of ES-EVIs */
-	struct zebra_es_evi_rb_head es_evi_rb_tree;
-
-	/* List of local ESs */
-	struct list *local_es_evi_list;
-};
-
 /* for parsing evpn and vni contexts */
 struct zebra_from_svi_param {
 	struct interface *br_if;
@@ -132,7 +70,16 @@ struct zebra_from_svi_param {
 
 struct interface *zvni_map_to_svi(vlanid_t vid, struct interface *br_if);
 
-static inline struct interface *zevpn_map_to_svi(struct zebra_evpn *zevpn)
+/*
+ * This function is called whenever a remote neigh is to be installed or
+ * removed.
+ * At the time of remote neigh istalltion, if the ifp is oper down,
+ * the remote neigh will not be installed. However, at the time of
+ * remote neigh uninstall, neigh will be uninstalled even if ifp is
+ * oper down. Caller must set check_oper_state = true at the time of
+ * installation and `false` during removal.
+ */
+static inline struct interface *zevpn_map_to_svi(struct zebra_evpn *zevpn, bool check_oper_state)
 {
 	struct interface *ifp;
 	struct zebra_if *zif = NULL;
@@ -147,9 +94,15 @@ static inline struct interface *zevpn_map_to_svi(struct zebra_evpn *zevpn)
 	vni = zebra_vxlan_if_vni_find(zif, zevpn->vni);
 	if (!vni)
 		return NULL;
+	/*
+	 * Caller has asked to check operation state of interface and
+	 * interface is operationally down. We're done.
+	 */
+	if (check_oper_state && !if_is_operative(ifp))
+		return NULL;
 
-	/* If down or not mapped to a bridge, we're done. */
-	if (!if_is_operative(ifp) || !zif->brslave_info.br_if)
+	/* If not mapped to a bridge, we're done. */
+	if (!zif->brslave_info.br_if)
 		return NULL;
 
 	return zvni_map_to_svi(vni->access_vlan, zif->brslave_info.br_if);

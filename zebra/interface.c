@@ -35,6 +35,7 @@
 #include "zebra/zebra_errors.h"
 #include "zebra/zebra_evpn_mh.h"
 #include "zebra/zebra_trace.h"
+#include "zebra/zebra_l2.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, ZINFO, "Zebra Interface Information");
 
@@ -1345,11 +1346,13 @@ static void zebra_if_addr_update_ctx(struct zebra_dplane_ctx *ctx,
 	}
 
 	/*
-	 * Linux kernel does not send route delete on interface down/addr del
+	 * Linux kernel does not send route delete on interface down/IPv4 last addr del
 	 * so we have to re-process routes it owns (i.e. kernel routes)
+	 * See rib_update_handle_kernel_route_down_possibility for more details
 	 */
-	if (op != DPLANE_OP_INTF_ADDR_ADD)
-		rib_update(RIB_UPDATE_KERNEL);
+	if (op != DPLANE_OP_INTF_ADDR_ADD && addr->family == AF_INET &&
+	    !if_has_connected_with_family(ifp, AF_INET))
+		rib_update(RIB_UPDATE_KERNEL_LAST_IPV4_ADDRESS_DELETED);
 }
 
 static void zebra_if_update_ctx(struct zebra_dplane_ctx *ctx,
@@ -1914,15 +1917,15 @@ static void interface_bridge_vlan_update(struct zebra_dplane_ctx *ctx,
 	uint16_t vid_range_start = 0;
 	int32_t i;
 
-	/* cache the old bitmap addrs */
-	old_vlan_bitmap = zif->vlan_bitmap;
-	/* create a new bitmap space for re-eval */
-	bf_init(zif->vlan_bitmap, IF_VLAN_BITMAP_MAX);
-
 	/* Could we have multiple bridge vlan infos? */
 	bvarray = dplane_ctx_get_ifp_bridge_vlan_info_array(ctx);
 	if (!bvarray)
 		return;
+
+	/* cache the old bitmap addrs */
+	old_vlan_bitmap = zif->vlan_bitmap;
+	/* create a new bitmap space for re-eval */
+	bf_init(zif->vlan_bitmap, IF_VLAN_BITMAP_MAX);
 
 	for (i = 0; i < bvarray->count; i++) {
 		bvinfo = bvarray->array[i];
@@ -2131,10 +2134,14 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 			if (protodown_set) {
 				interface_if_protodown(ifp, protodown,
 						       rc_bitfield);
+				/* Track kernel protodown state */
+				if (protodown)
+					SET_FLAG(zif->flags, ZIF_FLAG_KERNEL_PROTODOWN_SET);
+				else
+					UNSET_FLAG(zif->flags, ZIF_FLAG_KERNEL_PROTODOWN_SET);
 				if (startup)
 					if_sweep_protodown(zif);
 			}
-
 			if (IS_ZEBRA_IF_BRIDGE(ifp)) {
 				if (IS_ZEBRA_DEBUG_KERNEL)
 					zlog_debug(
@@ -2171,9 +2178,6 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 			frrtrace(8, frr_zebra, if_dplane_ifp_handling_new, name, ifindex, vrf_id,
 				 zif_type, zif_slave_type, master_ifindex, flags, 1);
 
-			/* Update flags - all paths need this */
-			ifp->flags = flags;
-
 			/*
 			 * Interface promiscuity changes trigger spurious routing updates on HBN
 			 * uplink interfaces, causing route flushes and traffic disruption.
@@ -2181,7 +2185,8 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 			 * Check if only promiscuity flag changed (from netlink change mask)
 			 */
 			if (change_flags == IFF_PROMISC) {
-				/* Flags already updated above, skip routing notifications */
+				ifp->flags = flags;
+				/* Flags updated above, skip routing notifications */
 				if (IS_ZEBRA_DEBUG_KERNEL)
 					zlog_debug("%s: PROMISC-only update for %s(%u), no routing notification",
 						   __func__, name, ifp->ifindex);
@@ -2213,13 +2218,29 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 			/* Update interface type */
 			ifp->zif_type = zif_type;
 
-			if (protodown_set)
+			/* Detect kernel protodown transition from set to cleared */
+			bool kernel_pd_was_set;
+			bool kernel_pd_cleared = false;
+
+			kernel_pd_was_set = CHECK_FLAG(zif->flags, ZIF_FLAG_KERNEL_PROTODOWN_SET);
+
+			if (protodown_set) {
 				interface_if_protodown(ifp, protodown,
 						       rc_bitfield);
+				/* Track kernel protodown state and detect transition */
+				if (protodown)
+					SET_FLAG(zif->flags, ZIF_FLAG_KERNEL_PROTODOWN_SET);
+				else {
+					if (kernel_pd_was_set)
+						kernel_pd_cleared = true;
+					UNSET_FLAG(zif->flags, ZIF_FLAG_KERNEL_PROTODOWN_SET);
+				}
+			}
 
 			if (if_is_no_ptm_operative(ifp)) {
 				bool is_up = if_is_operative(ifp);
 
+				ifp->flags = flags;
 				if (!if_is_no_ptm_operative(ifp) ||
 				    CHECK_FLAG(zif->flags,
 					       ZIF_FLAG_PROTODOWN)) {
@@ -2239,12 +2260,12 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 					 * interface status.
 					 */
 					if (IS_ZEBRA_DEBUG_KERNEL)
-						zlog_debug(
-							"Intf %s(%u) PTM up, notifying clients",
-							name, ifp->ifindex);
+						zlog_debug("Intf %s(%u) PTM up, notifying clients is_up:%d pd_cleared:%d",
+							   name, ifp->ifindex, is_up,
+							   kernel_pd_cleared);
 					frrtrace(3, frr_zebra, if_dplane_ifp_handling, name,
 						 ifp->ifindex, 2);
-					if_up(ifp, is_up);
+					if_up(ifp, kernel_pd_cleared || !is_up);
 
 					/*
 					 * Update EVPN VNI when SVI MAC change
@@ -2275,6 +2296,7 @@ static void zebra_if_dplane_ifp_handling(struct zebra_dplane_ctx *ctx)
 					}
 				}
 			} else {
+				ifp->flags = flags;
 				if (if_is_operative(ifp) &&
 				    !CHECK_FLAG(zif->flags,
 						ZIF_FLAG_PROTODOWN)) {
@@ -2873,13 +2895,31 @@ static void if_dump_vty(struct vty *vty, struct interface *ifp)
 		struct zebra_l2info_gre *gre_info;
 
 		gre_info = &zebra_if->l2info.gre;
-		if (gre_info->vtep_ip.s_addr != INADDR_ANY) {
-			vty_out(vty, "  VTEP IP: %pI4", &gre_info->vtep_ip);
-			if (gre_info->vtep_ip_remote.s_addr != INADDR_ANY)
-				vty_out(vty, " , remote %pI4",
-					&gre_info->vtep_ip_remote);
+		if (IS_IPADDR_V4(&gre_info->vtep_ip) &&
+		    gre_info->vtep_ip.ipaddr_v4.s_addr != INADDR_ANY) {
+			vty_out(vty, "  VTEP IP: %pI4", &gre_info->vtep_ip.ipaddr_v4);
+			if (IS_IPADDR_V4(&gre_info->vtep_ip_remote) &&
+			    gre_info->vtep_ip_remote.ipaddr_v4.s_addr != INADDR_ANY)
+				vty_out(vty, " , remote %pI4", &gre_info->vtep_ip_remote.ipaddr_v4);
 			vty_out(vty, "\n");
 		}
+		if (IS_IPADDR_V6(&gre_info->vtep_ip) &&
+		    IPV6_ADDR_CMP(&gre_info->vtep_ip.ipaddr_v6, &in6addr_any)) {
+			vty_out(vty, "  VTEP IP: %pI6", &gre_info->vtep_ip.ipaddr_v6);
+			if (IS_IPADDR_V6(&gre_info->vtep_ip_remote) &&
+			    IPV6_ADDR_CMP(&gre_info->vtep_ip_remote.ipaddr_v6, &in6addr_any))
+				vty_out(vty, " , remote %pI6", &gre_info->vtep_ip_remote.ipaddr_v6);
+			vty_out(vty, "\n");
+		}
+
+		if (gre_info->encap_flags) {
+			vty_out(vty, "  GRE encap flags ");
+			vty_out(vty, "checksum %s, ",
+				gre_info->encap_flags & ZEBRA_GRE_ENCAP_FLAGS_CSUM ? "on" : "off");
+			vty_out(vty, "checksum ipv6 %s\n",
+				gre_info->encap_flags & ZEBRA_GRE_ENCAP_FLAGS_CSUM6 ? "on" : "off");
+		}
+
 		if (gre_info->ifindex_link &&
 		    (gre_info->link_nsid != NS_UNKNOWN)) {
 			struct interface *nifp;
@@ -3277,14 +3317,30 @@ static void if_dump_vty_json(struct vty *vty, struct interface *ifp,
 		struct zebra_l2info_gre *gre_info;
 
 		gre_info = &zebra_if->l2info.gre;
-		if (gre_info->vtep_ip.s_addr != INADDR_ANY) {
+		if (IS_IPADDR_V4(&gre_info->vtep_ip) &&
+		    gre_info->vtep_ip.ipaddr_v4.s_addr != INADDR_ANY) {
 			json_object_string_addf(json_if, "vtepIp", "%pI4",
-						&gre_info->vtep_ip);
-			if (gre_info->vtep_ip_remote.s_addr != INADDR_ANY)
-				json_object_string_addf(
-					json_if, "vtepRemoteIp", "%pI4",
-					&gre_info->vtep_ip_remote);
+						&gre_info->vtep_ip.ipaddr_v4);
+			if (IS_IPADDR_V4(&gre_info->vtep_ip_remote) &&
+			    gre_info->vtep_ip_remote.ipaddr_v4.s_addr != INADDR_ANY)
+				json_object_string_addf(json_if, "vtepRemoteIp", "%pI4",
+							&gre_info->vtep_ip_remote.ipaddr_v4);
 		}
+		if (IS_IPADDR_V6(&gre_info->vtep_ip) &&
+		    IPV6_ADDR_CMP(&gre_info->vtep_ip.ipaddr_v6, &in6addr_any)) {
+			json_object_string_addf(json_if, "vtepIp", "%pI6",
+						&gre_info->vtep_ip.ipaddr_v6);
+			if (IS_IPADDR_V6(&gre_info->vtep_ip_remote) &&
+			    IPV6_ADDR_CMP(&gre_info->vtep_ip_remote.ipaddr_v6, &in6addr_any))
+				json_object_string_addf(json_if, "vtepRemoteIp", "%pI6",
+							&gre_info->vtep_ip_remote.ipaddr_v6);
+		}
+		json_object_boolean_add(json_if, "greEncapChecksum",
+					gre_info->encap_flags & ZEBRA_GRE_ENCAP_FLAGS_CSUM);
+		json_object_boolean_add(json_if, "greEncapIpv6Checksum",
+					gre_info->encap_flags & ZEBRA_GRE_ENCAP_FLAGS_CSUM6);
+
+
 		if (gre_info->ifindex_link
 		    && (gre_info->link_nsid != NS_UNKNOWN)) {
 			struct interface *nifp;

@@ -43,10 +43,18 @@
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_trace.h"
+#include "bgpd/bgp_ls.h"
 
 DEFINE_HOOK(peer_backward_transition, (struct peer * peer), (peer));
 DEFINE_HOOK(peer_status_changed, (struct peer * peer), (peer));
 DEFINE_HOOK(bgp_rpki_connection_status, (const char *vrf_name), (vrf_name));
+
+bool bgp_rpki_cache_connected(struct bgp *bgp)
+{
+	struct vrf *vrf = vrf_lookup_by_id(bgp->vrf_id);
+
+	return hook_call(bgp_rpki_connection_status, vrf ? vrf->name : VRF_DEFAULT_NAME);
+}
 
 /* Definition of display strings corresponding to FSM events. This should be
  * kept consistent with the events defined in bgpd.h
@@ -121,6 +129,9 @@ static void peer_xfer_stats(struct peer *peer_dst, struct peer *peer_src)
 	peer_dst->dynamic_cap_out += peer_src->dynamic_cap_out;
 }
 
+static void bgp_graceful_stale_timer_expire(struct event *event);
+static void bgp_graceful_restart_timer_expire(struct event *event);
+
 static struct peer *peer_xfer_conn(struct peer *from_peer)
 {
 	struct peer *peer;
@@ -172,8 +183,6 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 
 	bgp_writes_off(going_away);
 	bgp_reads_off(going_away);
-	bgp_writes_off(keeper);
-	bgp_reads_off(keeper);
 
 	/*
 	 * Before exchanging FD remove doppelganger from
@@ -210,6 +219,34 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 	from_peer->connection = going_away;
 	going_away->peer = from_peer;
 
+	/*
+	 * Migrate GR timers from going_away to keeper.  These were
+	 * armed in bgp_stop() on the config peer's old connection.
+	 * Cancel and re-arm so EVENT_ARG points to keeper, not the
+	 * going_away connection that will be freed with the doppelganger.
+	 */
+	if (event_is_scheduled(going_away->t_gr_stale)) {
+		struct timeval remain = event_timer_remain(going_away->t_gr_stale);
+
+		event_cancel(&going_away->t_gr_stale);
+		event_add_timer_tv(bm->master, bgp_graceful_stale_timer_expire, keeper, &remain,
+				   &keeper->t_gr_stale);
+		if (bgp_debug_neighbor_events(peer))
+			zlog_debug("%pBP %s: migrated stalepath timer (%ld sec remain) to keeper",
+				   peer, __func__, (long)remain.tv_sec);
+	}
+
+	if (event_is_scheduled(going_away->t_gr_restart)) {
+		struct timeval remain = event_timer_remain(going_away->t_gr_restart);
+
+		event_cancel(&going_away->t_gr_restart);
+		event_add_timer_tv(bm->master, bgp_graceful_restart_timer_expire, keeper, &remain,
+				   &keeper->t_gr_restart);
+		if (bgp_debug_neighbor_events(peer))
+			zlog_debug("%pBP %s: migrated restart timer (%ld sec remain) to keeper",
+				   peer, __func__, (long)remain.tv_sec);
+	}
+
 	peer->as = from_peer->as;
 	peer->v_holdtime = from_peer->v_holdtime;
 	peer->v_keepalive = from_peer->v_keepalive;
@@ -242,28 +279,22 @@ static struct peer *peer_xfer_conn(struct peer *from_peer)
 		XFREE(MTYPE_BGP_PEER_HOST, peer->hostname);
 		peer->hostname = NULL;
 	}
-	if (from_peer->hostname != NULL) {
-		peer->hostname = from_peer->hostname;
-		from_peer->hostname = NULL;
-	}
+	if (from_peer->hostname != NULL)
+		peer->hostname = XSTRDUP(MTYPE_BGP_PEER_HOST, from_peer->hostname);
 
 	if (peer->domainname) {
 		XFREE(MTYPE_BGP_PEER_HOST, peer->domainname);
 		peer->domainname = NULL;
 	}
-	if (from_peer->domainname != NULL) {
-		peer->domainname = from_peer->domainname;
-		from_peer->domainname = NULL;
-	}
+	if (from_peer->domainname != NULL)
+		peer->domainname = XSTRDUP(MTYPE_BGP_PEER_HOST, from_peer->domainname);
 
 	if (peer->soft_version) {
 		XFREE(MTYPE_BGP_SOFT_VERSION, peer->soft_version);
 		peer->soft_version = NULL;
 	}
-	if (from_peer->soft_version) {
-		peer->soft_version = from_peer->soft_version;
-		from_peer->soft_version = NULL;
-	}
+	if (from_peer->soft_version)
+		peer->soft_version = XSTRDUP(MTYPE_BGP_SOFT_VERSION, from_peer->soft_version);
 
 	FOREACH_AFI_SAFI (afi, safi) {
 		peer->af_sflags[afi][safi] = from_peer->af_sflags[afi][safi];
@@ -457,13 +488,13 @@ void bgp_timer_set(struct peer_connection *connection)
 		}
 		break;
 	case Deleted:
-		event_cancel(&peer->connection->t_gr_restart);
-		event_cancel(&peer->connection->t_gr_stale);
+		event_cancel(&connection->t_gr_restart);
+		event_cancel(&connection->t_gr_stale);
 
 		FOREACH_AFI_SAFI (afi, safi)
 			event_cancel(&peer->t_llgr_stale[afi][safi]);
 
-		event_cancel(&peer->connection->t_pmax_restart);
+		event_cancel(&connection->t_pmax_restart);
 		event_cancel(&peer->t_refresh_stalepath);
 		fallthrough;
 	case Clearing:
@@ -645,9 +676,9 @@ const char *const peer_down_str[] = {
 	"Cease: subcode unknown",
 };
 
-static void bgp_graceful_restart_timer_off(struct peer_connection *connection,
-					   struct peer *peer)
+static void bgp_graceful_restart_timer_off(struct peer_connection *connection)
 {
+	struct peer *peer = connection->peer;
 	afi_t afi;
 	safi_t safi;
 
@@ -697,7 +728,7 @@ static void bgp_llgr_stale_timer_expire(struct event *event)
 
 	bgp_clear_stale_route(peer, afi, safi);
 
-	bgp_graceful_restart_timer_off(peer->connection, peer);
+	bgp_graceful_restart_timer_off(peer->connection);
 }
 
 static void bgp_set_llgr_stale(struct peer *peer, afi_t afi, safi_t safi)
@@ -836,7 +867,7 @@ static void bgp_graceful_restart_timer_expire(struct event *event)
 		}
 	}
 
-	bgp_graceful_restart_timer_off(connection, peer);
+	bgp_graceful_restart_timer_off(connection);
 }
 
 static void bgp_graceful_stale_timer_expire(struct event *event)
@@ -953,7 +984,7 @@ static bool bgp_update_delay_applicable(struct bgp *bgp)
 {
 	/* update_delay_over flag should be reset (set to 0) for any new
 	   applicability of the update-delay during BGP process lifetime.
-	   And it should be set after an occurence of the update-delay is
+	   And it should be set after an occurrence of the update-delay is
 	   over)*/
 	if (!bgp->update_delay_over)
 		return true;
@@ -970,6 +1001,30 @@ bool bgp_update_delay_active(struct bgp *bgp)
 bool bgp_update_delay_configured(struct bgp *bgp)
 {
 	if (bgp->v_update_delay)
+		return true;
+	return false;
+}
+
+bool bgp_advertisement_delay_applicable(struct bgp *bgp)
+{
+	/* advertisement_delay_over is set when the delay has completed;
+	 * until then, the delay is applicable.
+	 */
+	if (!bgp->advertisement_delay_over)
+		return true;
+	return false;
+}
+
+bool bgp_advertisement_delay_active(struct bgp *bgp)
+{
+	if (bgp->t_advertisement_delay)
+		return true;
+	return false;
+}
+
+bool bgp_advertisement_delay_configured(struct bgp *bgp)
+{
+	if (bgp->v_advertisement_delay)
 		return true;
 	return false;
 }
@@ -1268,6 +1323,65 @@ static void bgp_establish_wait_timer(struct event *event)
 	bgp_check_update_delay(bgp);
 }
 
+/* Advertisement-delay timer expiry callback.
+ * When both update-delay and advertisement-delay are configured, route
+ * advertisements are released at max(update-delay, advertisement-delay).
+ * Whichever finishes last clears main_peers_update_hold and calls
+ * bgp_start_routeadv(). The other release point is in bgp_route.c
+ * (bgp_process_main_one, end-of-initial-update path).
+ */
+static void bgp_advertisement_delay_timer(struct event *thread)
+{
+	struct bgp *bgp;
+
+	bgp = EVENT_ARG(thread);
+	event_cancel(&bgp->t_advertisement_delay);
+	bgp->advertisement_delay_over = 1;
+
+	/* Update-delay is still in progress or best-path/zebra post-processing
+	 * has not completed yet. Route advertisements will be released from
+	 * bgp_route.c once update-delay post-processing finishes.
+	 */
+	if (bgp_update_delay_active(bgp) || bgp->main_zebra_update_hold) {
+		zlog_info("Advertisement delay expired for %s, update-delay processing not yet complete",
+			  bgp->name_pretty);
+		return;
+	}
+
+	zlog_info("Advertisement delay ended for %s.", bgp->name_pretty);
+
+	frr_timestamp(3, bgp->advertisement_delay_resume_time,
+		      sizeof(bgp->advertisement_delay_resume_time));
+
+	bgp->main_peers_update_hold = 0;
+	bgp_start_routeadv(bgp);
+}
+
+/*
+ * Begin advertisement-delay.
+ * Set the hold flag and start the timer.
+ */
+static void bgp_advertisement_delay_begin(struct bgp *bgp)
+{
+	bgp->advertisement_delay_started = 1;
+	bgp->main_peers_update_hold = 1;
+	event_add_timer(bm->master, bgp_advertisement_delay_timer, bgp, bgp->v_advertisement_delay,
+			&bgp->t_advertisement_delay);
+	zlog_info("Advertisement delay started - %d seconds for %s", bgp->v_advertisement_delay,
+		  bgp->name_pretty);
+}
+
+/*
+ * Handle first peer Established for advertisement-delay.
+ */
+static void bgp_advertisement_delay_process_status_change(struct peer *peer)
+{
+	struct bgp *bgp = peer->bgp;
+
+	if (peer_established(peer->connection) && !bgp->advertisement_delay_started)
+		bgp_advertisement_delay_begin(bgp);
+}
+
 /* Steps to begin the update delay:
      - initialize queues if needed
      - stop the queue processing
@@ -1306,7 +1420,7 @@ static void bgp_update_delay_process_status_change(struct peer *peer)
 				  bgp->v_update_delay);
 		}
 		if (CHECK_FLAG(peer->cap, PEER_CAP_GRACEFUL_RESTART_R_BIT_RCV))
-			bgp_update_restarted_peers(peer);
+			bgp_update_restarted_peers(peer->connection);
 	}
 	if (peer->connection->ostatus == Established && bgp_update_delay_active(bgp)) {
 		/* Adjust the update-delay state to account for this flap.
@@ -1381,7 +1495,7 @@ static bool bgp_gr_check_all_eors(struct bgp *bgp, afi_t afi, safi_t safi,
 			 * deferred bestpath selection.
 			 *
 			 * 1st level of deferred bestpath selection will
-			 * be done when EORs are recieved from all the
+			 * be done when EORs are received from all the
 			 * directly connected peers, or when the
 			 * select-deferral-timer expires. If the timer
 			 * expired, it means that some of the directly
@@ -1415,7 +1529,7 @@ static bool bgp_gr_check_all_eors(struct bgp *bgp, afi_t afi, safi_t safi,
 			 */
 			if (PEER_IS_MULTIHOP(peer)) {
 				/*
-				 * If we have not recieved EOR from a
+				 * If we have not received EOR from a
 				 * multihop peer, start the tier2
 				 * select-deferral-timer only if EORs
 				 * are rcvd from all the directly
@@ -1446,7 +1560,7 @@ static bool bgp_gr_check_all_eors(struct bgp *bgp, afi_t afi, safi_t safi,
 				}
 				/*
 				 * If this is a directly connected peer
-				 * and if we haven't recieved EOR from
+				 * and if we haven't received EOR from
 				 * this peer yet, then we will wait to
 				 * do the 1st round of deferred
 				 * bestpath.
@@ -1515,7 +1629,7 @@ void bgp_gr_check_path_select(struct bgp *bgp, afi_t afi, safi_t safi)
 	 * this AFI-SAFI.
 	 *
 	 * This function returns false if EORs are not rcvd for this AFI-SAFI
-	 * from all the dirctly connected peers.
+	 * from all the directly connected peers.
 	 */
 	if (bgp_gr_check_all_eors(bgp, afi, safi, &multihop_eors_pending)) {
 		gr_info = &(bgp->gr_info[afi][safi]);
@@ -1933,11 +2047,20 @@ void bgp_fsm_change_status(struct peer_connection *connection,
 			bgp->maxmed_onstartup_over = 1;
 	}
 
-	/* Check for GR restarter or update-delay processing. */
+	/* Check for GR restarter, update-delay, or advertisement-delay.
+	 * When GR is not applicable, both update-delay and advertisement-delay
+	 * can run independently.
+	 */
 	if (gr_path_select_deferral_applicable(bgp))
 		bgp_gr_process_peer_status_change(peer);
-	else if (bgp_update_delay_configured(bgp) && bgp_update_delay_applicable(bgp))
-		bgp_update_delay_process_status_change(peer);
+	else {
+		if (bgp_update_delay_configured(bgp) && bgp_update_delay_applicable(bgp))
+			bgp_update_delay_process_status_change(peer);
+
+		if (bgp_advertisement_delay_configured(bgp) &&
+		    bgp_advertisement_delay_applicable(bgp))
+			bgp_advertisement_delay_process_status_change(peer);
+	}
 
 	if (bgp_debug_neighbor_events(peer))
 		zlog_debug("%s fd %d went from %s to %s for %s", peer->host, connection->fd,
@@ -2062,6 +2185,12 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 				   bgp_peer_get_connection_direction_string(connection));
 		update_group_remove_peer_afs(peer);
 
+		/* Withdraw Link NLRI for BGP session (local -> peer) */
+		if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
+			if (bgp_ls_withdraw_bgp_link(bgp, peer) != 0)
+				zlog_warn("BGP-LS: Failed to withdraw link NLRI for peer %s",
+					  peer->host);
+
 		/* Reset peer synctime */
 		peer->synctime = 0;
 	}
@@ -2169,7 +2298,7 @@ enum bgp_fsm_state_progress bgp_stop(struct peer_connection *connection)
 	return ret;
 }
 
-/* BGP peer is stoped by the error. */
+/* BGP peer is stopped by the error. */
 static enum bgp_fsm_state_progress
 bgp_stop_with_error(struct peer_connection *connection)
 {
@@ -2374,13 +2503,12 @@ bgp_connect_success_w_delayopen(struct peer_connection *connection)
 				   bgp_peer_get_connection_direction_string(connection));
 	}
 
-	/* set the DelayOpenTime to the inital value */
+	/* set the DelayOpenTime to the initial value */
 	peer->v_delayopen = peer->delayopen;
 
 	/* Start the DelayOpenTimer if it is not already running */
-	if (!peer->connection->t_delayopen)
-		BGP_TIMER_ON(peer->connection->t_delayopen, bgp_delayopen_timer,
-			     peer->v_delayopen);
+	if (!connection->t_delayopen)
+		BGP_TIMER_ON(connection->t_delayopen, bgp_delayopen_timer, peer->v_delayopen);
 
 	frrtrace(2, frr_bgp, session_state_change, peer, 6);
 	if (bgp_debug_neighbor_events(peer))
@@ -2442,8 +2570,6 @@ static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 {
 	struct peer *peer = connection->peer;
 	enum connect_result status;
-	bool rpki_cache_connected;
-	struct vrf *vrf = vrf_lookup_by_id(peer->bgp->vrf_id);
 
 	bgp_peer_conf_if_to_su_update(connection);
 
@@ -2479,17 +2605,14 @@ static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 	/* Clear peer capability flag. */
 	peer->cap = 0;
 
-	if (peergroup_flag_check(peer, PEER_FLAG_RPKI_STRICT)) {
-		rpki_cache_connected = hook_call(bgp_rpki_connection_status,
-						 vrf ? vrf->name : VRF_DEFAULT_NAME);
-		if (!rpki_cache_connected) {
-			if (bgp_debug_neighbor_events(peer))
-				flog_err(EC_BGP_FSM,
-					 "%s [FSM] RPKI strict mode enabled, but RPKI cache is not connected",
-					 peer->host);
-			peer_set_last_reset(peer, PEER_DOWN_RPKI_DOWN);
-			return BGP_FSM_FAILURE;
-		}
+	if (peergroup_flag_check(peer, PEER_FLAG_RPKI_STRICT) &&
+	    !bgp_rpki_cache_connected(peer->bgp)) {
+		if (bgp_debug_neighbor_events(peer))
+			flog_err(EC_BGP_FSM,
+				 "%s [FSM] RPKI strict mode enabled, but RPKI cache is not connected",
+				 peer->host);
+		peer_set_last_reset(peer, PEER_DOWN_RPKI_DOWN);
+		return BGP_FSM_FAILURE;
 	}
 
 	if (peer->bgp->vrf_id == VRF_UNKNOWN) {
@@ -2548,8 +2671,8 @@ static enum bgp_fsm_state_progress bgp_start(struct peer_connection *connection)
 				   peer->host, connection->fd,
 				   bgp_peer_get_connection_direction_string(connection));
 		if (connection->fd < 0) {
-			flog_err(EC_BGP_FSM, "%s peer's fd is negative value %d",
-				 __func__, peer->connection->fd);
+			flog_err(EC_BGP_FSM, "%s peer's fd is negative value %d", __func__,
+				 connection->fd);
 			return BGP_FSM_FAILURE;
 		}
 		bgp_connect_in_progress_update_connection(connection);
@@ -2584,7 +2707,7 @@ bgp_reconnect(struct peer_connection *connection)
 	if (ret < BGP_FSM_SUCCESS)
 		return ret;
 
-	/* Send graceful restart capabilty */
+	/* Send graceful restart capability */
 	BGP_GR_ROUTER_DETECT_AND_SEND_CAPABILITY_TO_ZEBRA(bgp, bgp->peer);
 
 	return bgp_start(connection);
@@ -2736,7 +2859,6 @@ bgp_establish(struct peer_connection *connection)
 	struct peer *other;
 	struct peer *peer = connection->peer;
 	struct bgp *bgp = peer->bgp;
-	bool rpki_cache_connected;
 	struct vrf *vrf = NULL;
 
 	other = peer->doppelganger;
@@ -2758,19 +2880,6 @@ bgp_establish(struct peer_connection *connection)
 		if (other && other->connection)
 			(void)hash_get(bgp->connectionhash, other->connection, hash_alloc_intern);
 		return BGP_FSM_FAILURE;
-	}
-
-	if (peergroup_flag_check(peer, PEER_FLAG_RPKI_STRICT)) {
-		rpki_cache_connected = hook_call(bgp_rpki_connection_status,
-						 vrf ? vrf->name : VRF_DEFAULT_NAME);
-		if (!rpki_cache_connected) {
-			if (bgp_debug_neighbor_events(peer))
-				flog_err(EC_BGP_FSM,
-					 "%s [FSM] RPKI strict mode enabled, but RPKI cache is not connected",
-					 peer->host);
-			peer_set_last_reset(peer, PEER_DOWN_RPKI_DOWN);
-			return BGP_FSM_FAILURE;
-		}
 	}
 
 	/*
@@ -2835,10 +2944,9 @@ bgp_establish(struct peer_connection *connection)
 			       PEER_CAP_ORF_PREFIX_SM_ADV)) {
 			if (CHECK_FLAG(peer->af_cap[afi][safi],
 				       PEER_CAP_ORF_PREFIX_RM_RCV))
-				bgp_route_refresh_send(
-					peer, afi, safi, ORF_TYPE_PREFIX,
-					REFRESH_IMMEDIATE, 0,
-					BGP_ROUTE_REFRESH_NORMAL);
+				bgp_route_refresh_send(connection, afi, safi, ORF_TYPE_PREFIX,
+						       REFRESH_IMMEDIATE, 0,
+						       BGP_ROUTE_REFRESH_NORMAL);
 		}
 	}
 
@@ -2852,6 +2960,11 @@ bgp_establish(struct peer_connection *connection)
 					 PEER_STATUS_ORF_WAIT_REFRESH);
 	}
 
+	/* Generate Link NLRI for BGP session (local -> peer) */
+	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
+		if (bgp_ls_originate_bgp_link(bgp, peer) != 0)
+			zlog_warn("BGP-LS: Failed to originate link NLRI for peer %s", peer->host);
+
 	bgp_announce_peer(peer);
 
 	/* Start the route advertisement timer to send updates to the peer - if
@@ -2861,9 +2974,8 @@ bgp_establish(struct peer_connection *connection)
 	 * of read-only mode.
 	 */
 	if (!bgp_update_delay_active(bgp)) {
-		event_cancel(&peer->connection->t_routeadv);
-		BGP_TIMER_ON(peer->connection->t_routeadv, bgp_routeadv_timer,
-			     0);
+		event_cancel(&connection->t_routeadv);
+		BGP_TIMER_ON(connection->t_routeadv, bgp_routeadv_timer, 0);
 	}
 
 	if (peer->doppelganger &&

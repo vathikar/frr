@@ -283,6 +283,11 @@ int pim_global_config_write_worker(struct pim_instance *pim, struct vty *vty)
 
 	writes += pim_lookup_mode_write(pim, vty);
 
+	if (pim->join_filter.rmapname) {
+		vty_out(vty, " join-filter route-map %s\n", pim->join_filter.rmapname);
+		++writes;
+	}
+
 	return writes;
 }
 
@@ -328,9 +333,14 @@ static int gm_config_write(struct vty *vty, int writes,
 		++writes;
 	}
 
+	/* IF ip igmp robustness */
+	if (pim_ifp->gm_default_robustness_variable != GM_DEFAULT_ROBUSTNESS_VARIABLE) {
+		vty_out(vty, " ip igmp robustness %d\n", pim_ifp->gm_default_robustness_variable);
+		++writes;
+	}
+
 	/* IF ip igmp last-member_query-count */
-	if (pim_ifp->gm_last_member_query_count !=
-	    GM_DEFAULT_ROBUSTNESS_VARIABLE) {
+	if (pim_ifp->gm_last_member_query_count != 0) {
 		vty_out(vty, " ip igmp last-member-query-count %d\n",
 			pim_ifp->gm_last_member_query_count);
 		++writes;
@@ -410,9 +420,14 @@ static int gm_config_write(struct vty *vty, int writes,
 		vty_out(vty, " ipv6 mld query-interval %d\n",
 			pim_ifp->gm_default_query_interval);
 
+	/* IF ipv6 mld robustness */
+	if (pim_ifp->gm_default_robustness_variable != GM_DEFAULT_ROBUSTNESS_VARIABLE) {
+		vty_out(vty, " ipv6 mld robustness %d\n", pim_ifp->gm_default_robustness_variable);
+		++writes;
+	}
+
 	/* IF ipv6 mld last-member_query-count */
-	if (pim_ifp->gm_last_member_query_count !=
-	    GM_DEFAULT_ROBUSTNESS_VARIABLE)
+	if (pim_ifp->gm_last_member_query_count != 0)
 		vty_out(vty, " ipv6 mld last-member-query-count %d\n",
 			pim_ifp->gm_last_member_query_count);
 
@@ -556,10 +571,24 @@ int pim_config_write(struct vty *vty, int writes, struct interface *ifp,
 		++writes;
 	}
 
+	if (pim_ifp->pim_override_interval_msec != PIM_DEFAULT_OVERRIDE_INTERVAL_MSEC) {
+		vty_out(vty, " " PIM_AF_NAME " pim override-interval %u\n",
+			pim_ifp->pim_override_interval_msec);
+		++writes;
+	}
+
 	/* update source */
 	if (!pim_addr_is_any(pim_ifp->update_source)) {
 		vty_out(vty, " " PIM_AF_NAME " pim use-source %pPA\n",
 			&pim_ifp->update_source);
+		++writes;
+	}
+	/* allow-rp */
+	if (pim_ifp->allow_rp) {
+		vty_out(vty, " " PIM_AF_NAME " pim allow-rp");
+		if (pim_ifp->allow_rp_plist)
+			vty_out(vty, " rp-list %s", pim_ifp->allow_rp_plist);
+		vty_out(vty, "\n");
 		++writes;
 	}
 

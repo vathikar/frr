@@ -145,7 +145,7 @@ extern int sockopt_tcp_mss_set(int sock, int tcp_maxseg);
  * the segment size for TCP session
  *
  * sock
- *    Socket to get max segement size.
+ *    Socket to get max segment size.
  */
 extern int sockopt_tcp_mss_get(int sock);
 
@@ -177,6 +177,12 @@ extern int setsockopt_tcp_keepalive(int sock, uint16_t keepalive_idle,
  *    Socket to enable option on.
  */
 extern void sockopt_ip_transparent(int sock);
+
+extern int sockopt_reuseaddr(int sock);
+extern int sockopt_reuseport(int sock);
+extern int sockopt_v6only(int family, int sock);
+extern int sockopt_ttl(int family, int sock, int ttl);
+extern int sockopt_minttl(int family, int sock, int minttl);
 
 #ifdef __cplusplus
 }

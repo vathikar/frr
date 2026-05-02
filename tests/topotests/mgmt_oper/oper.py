@@ -64,6 +64,12 @@ def disable_debug(router):
 
 
 def clean_json(j):
+    if (
+        j is None
+        or not isinstance(j.get("frr-interface:lib"), dict)
+        or j["frr-interface:lib"].get("interface") is None
+    ):
+        return j
     rm_if_re = r"span|gre|sit|tnl|tun|vti"
     j = copy.deepcopy(j)
     try:
@@ -85,13 +91,13 @@ def _do_oper_test(tgen, qr, exact, seconds_left=None):
 
     qcmd = (
         r"vtysh -c 'show mgmt get-data {} {}' "
-        r"""| sed -e 's/"\(phy-address\|revision\|uptime\)": ".*"/"\1": "rubout"/'"""
-        r"""| sed -e 's/"\(candidate\|running\)-config-version": ".*"/"\1-config-version": "rubout"/'"""
-        r"""| sed -e 's/"\(id\|if-index\|mtu\|mtu6\|speed\)": [0-9][0-9]*/"\1": "rubout"/'"""
-        r"""| sed -e 's/"vrf": "[0-9]*"/"vrf": "rubout"/'"""
-        r"""| sed -e 's/"module-set-id": "[0-9]*"/"module-set-id": "rubout"/'"""
-        r"""| sed -e 's/"\(apply\|edit\|prep\)-count": "[0-9]*"/"\1-count": "rubout"/'"""
-        r"""| sed -e 's/"avg-\(apply\|edit\|prep\)-time": "[0-9]*"/"avg-\1-time": "rubout"/'"""
+        r"""| sed -e 's/"\(phy-address\|revision\|uptime\)": \?"[^"]*"/"\1":"rubout"/g'"""
+        r"""| sed -e 's/"\(candidate\|running\)-config-version": \?"[^"]*"/"\1-config-version":"rubout"/g'"""
+        r"""| sed -e 's/"\(id\|if-index\|mtu\|mtu6\|speed\)": \?[0-9][0-9]*/"\1":"rubout"/g'"""
+        r"""| sed -e 's/"vrf": \?"[0-9]*"/"vrf":"rubout"/g'"""
+        r"""| sed -e 's/"module-set-id": \?"[0-9]*"/"module-set-id":"rubout"/g'"""
+        r"""| sed -e 's/"\(apply\|edit\|prep\)-count": \?"[0-9]*"/"\1-count":"rubout"/g'"""
+        r"""| sed -e 's/"avg-\(apply\|edit\|prep\)-time": \?"[0-9]*"/"avg-\1-time":"rubout"/g'"""
     )
     # Don't use this for now.
     dd_json_cmp = None

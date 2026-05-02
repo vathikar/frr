@@ -18,6 +18,7 @@
 #include "bgp_addpath.h"
 #include "bgp_trace.h"
 #include "bgp_mpath.h"
+#include "bgp_ls.h"
 
 void bgp_table_lock(struct bgp_table *rt)
 {
@@ -99,9 +100,15 @@ inline struct bgp_dest *bgp_dest_unlock_node(struct bgp_dest *dest)
 		if (dest->mpath)
 			bgp_path_info_mpath_free(&dest->mpath);
 
+		if (dest->ls_nlri) {
+			if (rt->bgp && rt->bgp->ls_info)
+				bgp_ls_nlri_hash_del(&rt->bgp->ls_info->nlri_hash, dest->ls_nlri);
+			bgp_ls_nlri_free(dest->ls_nlri);
+		}
+
 		XFREE(MTYPE_BGP_NODE, dest);
 		dest = NULL;
-		rn->info = NULL;
+		route_node_set_info(rn, NULL);
 	}
 	route_unlock_node(rn);
 
@@ -130,7 +137,7 @@ static void bgp_node_destroy(route_table_delegate_t *delegate,
 			bgp_path_info_mpath_free(&dest->mpath);
 
 		XFREE(MTYPE_BGP_NODE, dest);
-		node->info = NULL;
+		route_node_set_info(node, NULL);
 	}
 
 	if (node->p.family == AF_FLOWSPEC)
@@ -156,6 +163,10 @@ struct bgp_table *bgp_table_init(struct bgp *bgp, afi_t afi, safi_t safi)
 	rt = XCALLOC(MTYPE_BGP_TABLE, sizeof(struct bgp_table));
 
 	rt->route_table = route_table_init_with_delegate(&bgp_table_delegate);
+
+	/* For EVPN, use a direct-lookup table mode, not an IP-oriented trie */
+	if (safi == SAFI_EVPN)
+		route_table_set_unique_mode(rt->route_table);
 
 	/*
 	 * Set up back pointer to bgp_table.
@@ -210,12 +221,19 @@ void bgp_delete_listnode(struct bgp_dest *dest)
 struct bgp_dest *bgp_table_subtree_lookup(const struct bgp_table *table,
 					  const struct prefix *p)
 {
-	struct bgp_dest *dest = bgp_dest_from_rnode(table->route_table->top);
+	struct bgp_dest *dest;
 	struct bgp_dest *matched = NULL;
 
+	/* Unique-mode case is special; no iteration or prefix search */
+	if (route_table_is_unique_mode(table->route_table)) {
+		dest = bgp_node_lookup(table, p);
+		return dest;
+	}
+
+	/* Search in LPM table */
+	dest = bgp_dest_from_rnode(table->route_table->top);
 	if (dest == NULL)
 		return NULL;
-
 
 	while (dest) {
 		const struct prefix *dest_p = bgp_dest_get_prefix(dest);

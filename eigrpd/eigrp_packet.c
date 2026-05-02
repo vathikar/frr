@@ -496,7 +496,7 @@ void eigrp_read(struct event *event)
 	   because this is at the beginning of the stream data buffer. */
 	iph = (struct ip *)STREAM_DATA(ibuf);
 
-	// Substract IPv4 header size from EIGRP Packet itself
+	// Subtract IPv4 header size from EIGRP Packet itself
 	if (iph->ip_v == 4)
 		length = (iph->ip_len) - 20U;
 
@@ -601,7 +601,7 @@ void eigrp_read(struct event *event)
 		return;
 	}
 
-	/* calcualte the eigrp packet length, and move the pounter to the
+	/* calculate the eigrp packet length, and move the pointer to the
 	   start of the eigrp TLVs */
 	opcode = eigrph->opcode;
 
@@ -1092,10 +1092,18 @@ static struct TLV_IPv4_Internal_type *eigrp_IPv4_InternalTLV_new(void)
 	return new;
 }
 
+/*
+ *  Returns NULL if data is not valid
+ */
 struct TLV_IPv4_Internal_type *eigrp_read_ipv4_tlv(struct stream *s)
 {
 	struct TLV_IPv4_Internal_type *tlv;
 	uint32_t destination_tmp;
+	size_t bytes;
+
+	/* Validate required length */
+	if (STREAM_READABLE(s) < 25)
+		return NULL;
 
 	tlv = eigrp_IPv4_InternalTLV_new();
 
@@ -1114,6 +1122,25 @@ struct TLV_IPv4_Internal_type *eigrp_read_ipv4_tlv(struct stream *s)
 	tlv->metric.flags = stream_getc(s);
 
 	tlv->prefix_length = stream_getc(s);
+
+	if (tlv->prefix_length > 32) {
+		eigrp_IPv4_InternalTLV_free(tlv);
+		return NULL;
+	}
+
+	/* Validate additional length needed based on prefix length */
+	bytes = 1;
+	if (tlv->prefix_length > 24)
+		bytes = 4;
+	else if (tlv->prefix_length > 16)
+		bytes = 3;
+	else if (tlv->prefix_length > 8)
+		bytes = 2;
+
+	if (STREAM_READABLE(s) < bytes) {
+		eigrp_IPv4_InternalTLV_free(tlv);
+		return NULL;
+	}
 
 	destination_tmp = (uint32_t)stream_getc(s) << 24;
 	if (tlv->prefix_length > 8)

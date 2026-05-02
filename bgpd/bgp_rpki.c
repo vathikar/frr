@@ -155,7 +155,7 @@ static enum route_map_cmd_result_t route_match(void *rule,
 
 					       void *object);
 static void *route_match_compile(const char *arg);
-static void revalidate_bgp_node(struct bgp_dest *dest, afi_t afi, safi_t safi);
+static void revalidate_bgp_node(struct bgp *bgp, struct bgp_dest *dest, afi_t afi, safi_t safi);
 static struct rpki_vrf *get_rpki_vrf(const char *vrfname);
 
 static bool rpki_debug_conf, rpki_debug_term;
@@ -444,6 +444,7 @@ static void rpki_delete_all_cache_nodes(struct rpki_vrf *rpki_vrf)
 			rtr_mgr_remove_group(rpki_vrf->rtr_config,
 					     cache->preference);
 		listnode_delete(rpki_vrf->cache_list, cache);
+		free_cache(cache);
 	}
 }
 
@@ -610,7 +611,7 @@ static void rpki_revalidate_prefix(struct event *event)
 
 	while (node) {
 		if (bgp_dest_has_bgp_path_info_data(node)) {
-			revalidate_bgp_node(node, rrp->afi, rrp->safi);
+			revalidate_bgp_node(rrp->bgp, node, rrp->afi, rrp->safi);
 		}
 
 		node = bgp_route_next_until(node, match);
@@ -706,9 +707,10 @@ static void bgpd_sync_callback(struct event *event)
 	revalidate_single_prefix(vrf, prefix, afi);
 }
 
-static void revalidate_bgp_node(struct bgp_dest *bgp_dest, afi_t afi, safi_t safi)
+static void revalidate_bgp_node(struct bgp *bgp, struct bgp_dest *bgp_dest, afi_t afi, safi_t safi)
 {
 	struct bgp_adj_in *ain;
+	struct bgp_path_info *bpi;
 	mpls_label_t *label;
 	uint8_t num_labels;
 
@@ -721,6 +723,26 @@ static void revalidate_bgp_node(struct bgp_dest *bgp_dest, afi_t afi, safi_t saf
 		(void)bgp_update(ain->peer, bgp_dest_get_prefix(bgp_dest), ain->addpath_rx_id,
 				 ain->attr, afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL, NULL,
 				 label, num_labels, 1, NULL);
+	}
+
+	/* Locally originated routes (e.g., 'network' statement) have no adj_in
+	 * entry, so bgp_update() above won't cover them.  Force re-advertisement
+	 * so the outbound route-map re-evaluates the updated RPKI state.
+	 * If we have something like:
+	 * route-map out deny 10
+	 *   match rpki invalid
+	 * route-map out permit 20
+	 * Then a locally originated route that becomes RPKI invalid needs to be
+	 * re-evaluated against the route-map, and if we don't force
+	 * re-advertisement, it won't be.
+	 */
+	for (bpi = bgp_dest_get_bgp_path_info(bgp_dest); bpi; bpi = bpi->next) {
+		if (bpi->peer == bgp->peer_self && bpi->type == ZEBRA_ROUTE_BGP &&
+		    (bpi->sub_type == BGP_ROUTE_STATIC || bpi->sub_type == BGP_ROUTE_AGGREGATE)) {
+			bgp_path_info_set_flag(bgp_dest, bpi, BGP_PATH_ATTR_CHANGED);
+			bgp_process(bgp, bgp_dest, bpi, afi, safi);
+			break;
+		}
 	}
 }
 
@@ -955,9 +977,16 @@ static int start(struct rpki_vrf *rpki_vrf)
 
 static void stop(struct rpki_vrf *rpki_vrf)
 {
+	struct listnode *cache_node;
+	struct cache *cache;
+
 	rpki_vrf->rtr_is_stopping = true;
 	if (is_running(rpki_vrf)) {
 		event_cancel(&rpki_vrf->t_rpki_sync);
+
+		for (ALL_LIST_ELEMENTS_RO(rpki_vrf->cache_list, cache_node, cache))
+			frr_pthread_non_controlled_shutdown(cache->rtr_socket->thread_id);
+
 		rtr_mgr_stop(rpki_vrf->rtr_config);
 		rtr_mgr_free(rpki_vrf->rtr_config);
 		rpki_vrf->rtr_is_running = false;
@@ -1262,7 +1291,7 @@ static int rpki_create_socket(void *_cache)
 	socklen_t optlen;
 	char *host, *port;
 	struct vrf *vrf;
-	int cancel_state;
+	int cancel_state = 0;
 	int socket;
 	int ret;
 #if defined(FOUND_SSH)
@@ -1705,8 +1734,8 @@ DEFPY (no_rpki,
 	if (!rpki_vrf)
 		return CMD_WARNING;
 
-	rpki_delete_all_cache_nodes(rpki_vrf);
 	stop(rpki_vrf);
+	rpki_delete_all_cache_nodes(rpki_vrf);
 	rpki_vrf->polling_period = POLLING_PERIOD_DEFAULT;
 	rpki_vrf->expire_interval = EXPIRE_INTERVAL_DEFAULT;
 	rpki_vrf->retry_interval = RETRY_INTERVAL_DEFAULT;

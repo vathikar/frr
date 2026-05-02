@@ -106,7 +106,7 @@ void bfd_cli_show_header_end(struct vty *vty, const struct lyd_node *dnode
 
 DEFPY_YANG_NOSH(
 	bfd_peer_enter, bfd_peer_enter_cmd,
-	"peer <A.B.C.D|X:X::X:X> [{multihop$multihop|local-address <A.B.C.D|X:X::X:X>|interface IFNAME$ifname|vrf NAME}]",
+	"peer <A.B.C.D|X:X::X:X>$peer [{multihop$multihop|local-address <A.B.C.D|X:X::X:X>|interface IFNAME$ifname|vrf NAME}]",
 	PEER_STR
 	PEER_IPV4_STR
 	PEER_IPV6_STR
@@ -173,7 +173,7 @@ DEFPY_YANG_NOSH(
 
 DEFPY_YANG(
 	bfd_no_peer, bfd_no_peer_cmd,
-	"no peer <A.B.C.D|X:X::X:X> [{multihop$multihop|local-address <A.B.C.D|X:X::X:X>|interface IFNAME$ifname|vrf NAME}]",
+	"no peer <A.B.C.D|X:X::X:X>$peer [{multihop$multihop|local-address <A.B.C.D|X:X::X:X>|interface IFNAME$ifname|vrf NAME}]",
 	NO_STR
 	PEER_STR
 	PEER_IPV4_STR
@@ -225,13 +225,13 @@ DEFPY_YANG(
 
 	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
 
-	/* Apply settings immediatly. */
+	/* Apply settings immediately. */
 	return nb_cli_apply_changes(vty, NULL);
 }
 
 DEFPY_YANG_NOSH(
 	sbfd_echo_peer_enter, sbfd_echo_peer_enter_cmd,
-	"peer <A.B.C.D|X:X::X:X> bfd-mode sbfd-echo bfd-name BFDNAME$bfdname \
+	"peer <A.B.C.D|X:X::X:X>$peer bfd-mode sbfd-echo bfd-name BFDNAME$bfdname \
 	[multihop$multihop] local-address <A.B.C.D|X:X::X:X> [vrf NAME] \
 	srv6-source-ipv6 X:X::X:X srv6-encap-data X:X::X:X...",
 	PEER_STR
@@ -305,7 +305,7 @@ DEFPY_YANG_NOSH(
 
 DEFPY_YANG(
 	sbfd_echo_no_peer, sbfd_echo_no_peer_cmd,
-	"no peer <A.B.C.D|X:X::X:X> bfd-mode sbfd-echo bfd-name BFDNAME$bfdname \
+	"no peer <A.B.C.D|X:X::X:X>$peer bfd-mode sbfd-echo bfd-name BFDNAME$bfdname \
 	[multihop$multihop] local-address <A.B.C.D|X:X::X:X> [vrf NAME] \
 	srv6-source-ipv6 X:X::X:X srv6-encap-data X:X::X:X...",
 	NO_STR
@@ -341,14 +341,14 @@ DEFPY_YANG(
 
 	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
 
-	/* Apply settings immediatly. */
+	/* Apply settings immediately. */
 	return nb_cli_apply_changes(vty, NULL);
 }
 
 
 DEFPY_YANG_NOSH(
 	sbfd_init_peer_enter, sbfd_init_peer_enter_cmd,
-	"peer <A.B.C.D|X:X::X:X> bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
+	"peer <A.B.C.D|X:X::X:X>$peer bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
 	[multihop$multihop] local-address <A.B.C.D|X:X::X:X> [vrf NAME] \
 	remote-discr (1-4294967295)$discr srv6-source-ipv6 X:X::X:X srv6-encap-data X:X::X:X...",
 	PEER_STR
@@ -440,7 +440,7 @@ DEFPY_YANG_NOSH(
 
 DEFPY_YANG(
 	sbfd_init_no_peer, sbfd_init_no_peer_cmd,
-	"no peer <A.B.C.D|X:X::X:X> bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
+	"no peer <A.B.C.D|X:X::X:X>$peer bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
 	[multihop$multihop] local-address <A.B.C.D|X:X::X:X> [vrf NAME] \
 	remote-discr (0-4294967295)$discr srv6-source-ipv6 X:X::X:X srv6-encap-data X:X::X:X...",
 	NO_STR
@@ -478,13 +478,13 @@ DEFPY_YANG(
 
 	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
 
-	/* Apply settings immediatly. */
+	/* Apply settings immediately. */
 	return nb_cli_apply_changes(vty, NULL);
 }
 
 DEFPY_YANG_NOSH(
 	sbfd_init_peer_raw_enter, sbfd_init_peer_raw_enter_cmd,
-	"peer <A.B.C.D|X:X::X:X> bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
+	"peer <A.B.C.D|X:X::X:X>$peer bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
 	[multihop$multihop] local-address <A.B.C.D|X:X::X:X> [vrf NAME] \
 	remote-discr (1-4294967295)$discr",
 	PEER_STR
@@ -559,7 +559,7 @@ DEFPY_YANG_NOSH(
 
 DEFPY_YANG(
 	sbfd_init_no_peer_raw, sbfd_init_no_peer_raw_cmd,
-	"no peer <A.B.C.D|X:X::X:X> bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
+	"no peer <A.B.C.D|X:X::X:X>$peer bfd-mode sbfd-init bfd-name BFDNAME$bfdname \
 	[multihop$multihop] local-address <A.B.C.D|X:X::X:X> [vrf NAME] \
 	remote-discr (0-4294967295)$discr",
 	NO_STR
@@ -593,7 +593,7 @@ DEFPY_YANG(
 
 	nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
 
-	/* Apply settings immediatly. */
+	/* Apply settings immediately. */
 	return nb_cli_apply_changes(vty, NULL);
 }
 
@@ -1283,7 +1283,7 @@ DEFPY(
 
 	out = ttable_dump(tt, "\n");
 	vty_out(vty, "%s", out);
-	XFREE(MTYPE_TMP, out);
+	XFREE(MTYPE_TMP_TTABLE, out);
 	ttable_del(tt);
 
 	return CMD_SUCCESS;
@@ -1303,7 +1303,6 @@ struct cmd_node bfd_profile_node = {
 
 static void bfd_profile_var(vector comps, struct cmd_token *token)
 {
-	extern struct bfdproflist bplist;
 	struct bfd_profile *bp;
 
 	TAILQ_FOREACH (bp, &bplist, entry) {
@@ -1311,9 +1310,49 @@ static void bfd_profile_var(vector comps, struct cmd_token *token)
 	}
 }
 
+struct bfd_peer_var_walk_ctx {
+	vector comps;
+	struct cmd_token *token;
+};
+
+static void bfd_peer_var_walker(struct hash_bucket *hb, void *arg)
+{
+	struct bfd_peer_var_walk_ctx *ctx = arg;
+	struct bfd_session *bs = hb->data;
+	char addr_buf[INET6_ADDRSTRLEN];
+	enum cmd_token_type match_type;
+
+	if (!CHECK_FLAG(bs->flags, BFD_SESS_FLAG_CONFIG))
+		return;
+
+	if (bs->key.family == AF_INET)
+		match_type = IPV4_TKN;
+	else if (bs->key.family == AF_INET6)
+		match_type = IPV6_TKN;
+	else
+		return;
+
+	if (ctx->token->type != match_type)
+		return;
+
+	if (inet_ntop(bs->key.family, &bs->key.peer, addr_buf, sizeof(addr_buf)))
+		vector_set(ctx->comps, XSTRDUP(MTYPE_COMPLETION, addr_buf));
+}
+
+static void bfd_peer_var(vector comps, struct cmd_token *token)
+{
+	struct bfd_peer_var_walk_ctx ctx = {
+		.comps = comps,
+		.token = token,
+	};
+
+	bfd_key_iterate(bfd_peer_var_walker, &ctx);
+}
+
 static const struct cmd_variable_handler bfd_vars[] = {
-	{.tokenname = "BFDPROF", .completions = bfd_profile_var},
-	{.completions = NULL}
+	{ .varname = "peer", .completions = bfd_peer_var },
+	{ .tokenname = "BFDPROF", .completions = bfd_profile_var },
+	{ .completions = NULL }
 };
 
 void

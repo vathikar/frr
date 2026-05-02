@@ -387,16 +387,14 @@ static int zebra_vxlan_if_update_vni(struct interface *ifp,
 		if (CHECK_FLAG(chgflags, ZEBRA_VXLIF_MASTER_CHANGE))
 			zebra_evpn_read_mac_neigh(zevpn, ifp);
 		else if (CHECK_FLAG(chgflags, ZEBRA_VXLIF_VLAN_CHANGE)) {
-			struct neigh_walk_ctx n_wctx;
+			struct zebra_neigh *n;
 
 			zebra_evpn_read_mac_neigh(zevpn, ifp);
 
 			zebra_evpn_rem_mac_install_all(zevpn);
 
-			memset(&n_wctx, 0, sizeof(n_wctx));
-			n_wctx.zevpn = zevpn;
-			hash_iterate(zevpn->neigh_table,
-				     zebra_evpn_install_neigh_hash, &n_wctx);
+			frr_each (zebra_neigh_db, zevpn->neigh_table, n)
+				zebra_evpn_install_neigh_hash(zevpn, n);
 		}
 	}
 
@@ -543,7 +541,7 @@ static int zebra_vxlan_if_add_update_vni(struct zebra_if *zif,
 	ctx->old_vni = *old_vni;
 	ctx->chgflags = ZEBRA_VXLIF_VLAN_CHANGE;
 
-	/* copy mcast group from old_vni as thats not being changed here */
+	/* copy mcast group from old_vni as that's not being changed here */
 	vni->mcast_grp = old_vni->mcast_grp;
 
 	if (old_vni->access_vlan != vni->access_vlan) {

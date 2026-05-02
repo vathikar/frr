@@ -80,6 +80,8 @@
 #include "bgpd/bgp_mac.h"
 #include "bgpd/bgp_trace.h"
 #include "bgpd/bgp_srv6.h"
+#include "bgpd/bgp_ls.h"
+#include "bgpd/bgp_ls_ted.h"
 
 DEFINE_MTYPE_STATIC(BGPD, PEER_TX_SHUTDOWN_MSG, "Peer shutdown message (TX)");
 DEFINE_QOBJ_TYPE(bgp_master);
@@ -94,9 +96,6 @@ DECLARE_DLIST(bgp_peer_conn_errlist, struct peer_connection, conn_err_link);
 
 /* List of info about peers that are being cleared from BGP RIBs in a batch */
 DECLARE_DLIST(bgp_clearing_info, struct bgp_clearing_info, link);
-
-/* List of dests that need to be processed in a clearing batch */
-DECLARE_LIST(bgp_clearing_destlist, struct bgp_clearing_dest, link);
 
 /* Hash of peers in clearing info object */
 static int peer_clearing_hash_cmp(const struct peer *p1, const struct peer *p2);
@@ -306,7 +305,7 @@ void bgp_option_norib_unset_runtime(void)
 	zlog_info("All routes have been installed in RIB (Zebra)");
 }
 
-/* Internal function to set BGP structure configureation flag.  */
+/* Internal function to set BGP structure configuration flag.  */
 static void bgp_config_set(struct bgp *bgp, int config)
 {
 	SET_FLAG(bgp->config, config);
@@ -340,6 +339,9 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 
 	vpn_handle_router_id_update(bgp, true, is_config);
 
+	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
+		bgp_ls_withdraw_all(bgp);
+
 	hook_call(bgp_routerid_update, bgp, true);
 
 	IPV4_ADDR_COPY(&bgp->router_id, id);
@@ -358,6 +360,9 @@ static int bgp_router_id_set(struct bgp *bgp, const struct in_addr *id,
 		bgp_evpn_handle_router_id_update(bgp, false);
 
 	vpn_handle_router_id_update(bgp, false, is_config);
+
+	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
+		bgp_ls_export_bgp_topology(bgp);
 
 	hook_call(bgp_routerid_update, bgp, false);
 	return 0;
@@ -448,17 +453,23 @@ void bgp_router_id_static_set(struct bgp *bgp, struct in_addr id)
 			  true /* is config */);
 }
 
-void bm_wait_for_fib_set(bool set)
+void bm_wait_for_fib_set(bool set, uint16_t adv_delay)
 {
 	bool send_msg = false;
 	struct bgp *bgp;
 	struct peer *peer;
 	struct listnode *next, *node;
 
-	if (bm->wait_for_fib == set)
+	/* If only the delay changed, update it without resetting peers */
+	if (bm->wait_for_fib == set) {
+		if (set && bm->suppress_fib_adv_delay != adv_delay)
+			bm->suppress_fib_adv_delay = adv_delay;
 		return;
+	}
 
 	bm->wait_for_fib = set;
+	bm->suppress_fib_adv_delay = adv_delay;
+
 	if (set) {
 		if (bgp_suppress_fib_count == 0)
 			send_msg = true;
@@ -488,23 +499,60 @@ void bm_wait_for_fib_set(bool set)
 				continue;
 
 			peer_notify_config_change(peer->connection);
+			/* Since this is a local config change, not a graceful restart.
+			 * Clear NSF_WAIT so clearing properly removes paths instead of
+			 * marking them STALE. Routes need a fresh Zebra round-trip to
+			 * set FIB_INSTALLED correctly.
+			 */
+			UNSET_FLAG(peer->sflags, PEER_STATUS_NSF_WAIT);
 		}
 	}
 }
 
 /* Set the suppress fib pending for the bgp configuration */
-void bgp_suppress_fib_pending_set(struct bgp *bgp, bool set)
+void bgp_suppress_fib_pending_set(struct bgp *bgp, bool set, uint16_t adv_delay)
 {
 	bool send_msg = false;
+	bool is_retry = false;
 	struct peer *peer;
 	struct listnode *node;
 
 	if (bgp->inst_type == BGP_INSTANCE_TYPE_VIEW)
 		return;
 
-	/* Do nothing if already in a desired state */
-	if (set == !!CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING))
+	/* Check if this is a retry of a previously deferred operation */
+	if (CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING_OP_DEFERRED)) {
+		is_retry = true;
+		UNSET_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING_OP_DEFERRED);
+	}
+
+	/* If only the delay changed, update it without resetting peers */
+	if (!is_retry && set == !!CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING)) {
+		if (set && bgp->suppress_fib_adv_delay != adv_delay) {
+			bgp->suppress_fib_adv_delay = adv_delay;
+			return;
+		}
 		return;
+	}
+
+	bgp->suppress_fib_adv_delay = adv_delay;
+
+	if (!bgp_zclient || bgp_zclient->sock < 0) {
+		/* Socket not ready - mark operation as failed */
+		if (set)
+			SET_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING);
+		else
+			UNSET_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING);
+
+		SET_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING_OP_DEFERRED);
+
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("%s: OP_DEFERRED bgp=%s %s zclient=%p sock=%d", __func__,
+				   bgp->name_pretty, set ? "enable" : "disable", bgp_zclient,
+				   bgp_zclient ? bgp_zclient->sock : -1);
+
+		return;
+	}
 
 	if (set) {
 		SET_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING);
@@ -516,7 +564,8 @@ void bgp_suppress_fib_pending_set(struct bgp *bgp, bool set)
 		bgp_suppress_fib_count++;
 	} else {
 		UNSET_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING);
-		bgp_suppress_fib_count--;
+		if (bgp_suppress_fib_count > 0)
+			bgp_suppress_fib_count--;
 
 		/* Send msg to zebra if there are no instances enabled
 		 * with suppress fib
@@ -529,9 +578,7 @@ void bgp_suppress_fib_pending_set(struct bgp *bgp, bool set)
 		if (BGP_DEBUG(zebra, ZEBRA))
 			zlog_debug("Sending ZEBRA_ROUTE_NOTIFY_REQUEST");
 
-		if (bgp_zclient)
-			zebra_route_notify_send(ZEBRA_ROUTE_NOTIFY_REQUEST,
-					bgp_zclient, set);
+		zebra_route_notify_send(ZEBRA_ROUTE_NOTIFY_REQUEST, bgp_zclient, set);
 	}
 
 	/*
@@ -547,7 +594,51 @@ void bgp_suppress_fib_pending_set(struct bgp *bgp, bool set)
 			continue;
 
 		peer_notify_config_change(peer->connection);
+		/* Since this is a local config change, not a graceful restart.
+		 * Clear NSF_WAIT so clearing properly removes paths instead of
+		 * marking them STALE. Routes need a fresh Zebra round-trip to
+		 * set FIB_INSTALLED correctly.
+		 */
+		UNSET_FLAG(peer->sflags, PEER_STATUS_NSF_WAIT);
 	}
+}
+
+/* Retry suppress-fib-pending configuration when Zebra connection is established
+ * This handles the race condition where config is applied before BGP-Zebra connection is ready
+ */
+void bgp_zebra_suppress_fib_pending_config_retry(void)
+{
+	struct bgp *bgp;
+	struct listnode *node;
+
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
+		/* Skip if no deferred operation pending for this bgp instance */
+		if (!CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING_OP_DEFERRED))
+			continue;
+
+		bool desired_enable = CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING);
+
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("%s: RETRY Executing deferred %s for bgp=%s bgp_suppress_fib_count=%d",
+				   __func__, desired_enable ? "enable" : "disable",
+				   bgp->name_pretty, bgp_suppress_fib_count);
+
+		bgp_suppress_fib_pending_set(bgp, desired_enable,
+					     bgp->suppress_fib_adv_delay);
+	}
+}
+
+/*
+ * Return the effective suppress-fib advertisement delay for a BGP instance.
+ * Per-instance value takes precedence; falls back to the global bm value.
+ */
+uint16_t bgp_suppress_fib_get_adv_delay(struct bgp *bgp)
+{
+	if (CHECK_FLAG(bgp->flags, BGP_FLAG_SUPPRESS_FIB_PENDING))
+		return bgp->suppress_fib_adv_delay;
+	if (bm->wait_for_fib)
+		return bm->suppress_fib_adv_delay;
+	return BGP_DEFAULT_SUPPRESS_FIB_ADV_DELAY;
 }
 
 /* BGP's cluster-id control. */
@@ -652,6 +743,22 @@ void bgp_confederation_id_set(struct bgp *bgp, as_t as, const char *as_str)
 	if (as == 0)
 		return;
 
+	/* Check if confederation ID is unchanged */
+	if (bgp->confed_id == as) {
+		/* Check if pretty string is also unchanged */
+		if (bgp->confed_id_pretty && as_str && strmatch(bgp->confed_id_pretty, as_str)) {
+			/* Nothing changed, just return */
+			return;
+		}
+
+		/* confed_id same, but pretty string changed - update only the string */
+		if (bgp->confed_id_pretty)
+			XFREE(MTYPE_BGP_NAME, bgp->confed_id_pretty);
+		bgp->confed_id_pretty = XSTRDUP(MTYPE_BGP_NAME, as_str);
+		/* No peer reset needed */
+		return;
+	}
+
 	/* Remember - were we doing confederation before? */
 	already_confed = bgp_config_check(bgp, BGP_CONFIG_CONFEDERATION);
 	bgp->confed_id = as;
@@ -677,7 +784,7 @@ void bgp_confederation_id_set(struct bgp *bgp, as_t as, const char *as_str)
 					bgp_session_reset_safe(peer, &nnode);
 			}
 		} else {
-			/* Not doign confederation before, so reset every
+			/* Not doing confederation before, so reset every
 			   non-local
 			   session */
 			if (ptype != BGP_PEER_IBGP) {
@@ -698,6 +805,9 @@ void bgp_confederation_id_unset(struct bgp *bgp)
 {
 	struct peer *peer;
 	struct listnode *node, *nnode;
+
+	if (!bgp_config_check(bgp, BGP_CONFIG_CONFEDERATION))
+		return;
 
 	bgp->confed_id = 0;
 	XFREE(MTYPE_BGP_NAME, bgp->confed_id_pretty);
@@ -1108,8 +1218,16 @@ static inline enum bgp_peer_sort peer_calc_sort(struct peer *peer)
 			assert(peer->group);
 			peer1 = listnode_head(peer->group->peer);
 
-			if (peer1)
+			if (peer1) {
+				/* AS_AUTO without INTERNAL/EXTERNAL bits means
+				 * the type is not yet resolved (no session up).
+				 * Treat as unestablished so it doesn't block
+				 * other members from being configured.
+				 */
+				if (peer1->as_type == AS_AUTO)
+					return BGP_PEER_INTERNAL;
 				return peer1->sort;
+			}
 		}
 		return BGP_PEER_INTERNAL;
 	}
@@ -1126,6 +1244,11 @@ static inline enum bgp_peer_sort peer_calc_sort(struct peer *peer)
 				else
 					return BGP_PEER_EBGP;
 			} else {
+				/* If the peer's AS is the same as the confederation ID,
+				 * then treat if as an iBGP peer.
+				 */
+				if (peer->as == bgp->confed_id)
+					return BGP_PEER_IBGP;
 				if (local_as == bgp->confed_id)
 					return BGP_PEER_EBGP;
 				else
@@ -1622,7 +1745,7 @@ struct srv6_locator *bgp_srv6_locator_lookup(struct bgp *bgp_vrf, struct bgp *bg
 	return NULL;
 }
 
-/* Allocate new peer object, implicitely locked.  */
+/* Allocate new peer object, implicitly locked.  */
 struct peer *peer_new(struct bgp *bgp, union sockunion *su, enum connection_direction dir)
 {
 	afi_t afi;
@@ -2279,43 +2402,17 @@ int peer_remote_as(struct bgp *bgp, union sockunion *su, const char *conf_if,
 			return BGP_ERR_INVALID_FOR_DYNAMIC_PEER;
 		}
 
-		/* When this peer is a member of peer-group.  */
-		if (peer->group) {
-			/* peer-group already has AS number/internal/external */
-			if (peer->group->conf->as || peer->group->conf->as_type != AS_UNSPECIFIED) {
-				/* Return peer group's AS number.  */
-				*as = peer->group->conf->as;
-				return BGP_ERR_PEER_GROUP_MEMBER;
-			}
-
-			enum bgp_peer_sort peer_sort_type =
-				peer_sort(peer->group->conf);
-
-			/* Explicit AS numbers used, compare AS numbers */
-			if (as_type == AS_SPECIFIED) {
-				if (((peer_sort_type == BGP_PEER_IBGP)
-				    && (bgp->as != *as))
-				    || ((peer_sort_type == BGP_PEER_EBGP)
-				    && (bgp->as == *as))) {
-					*as = peer->as;
-					return BGP_ERR_PEER_GROUP_PEER_TYPE_DIFFERENT;
-				}
-			} else {
-				/* internal/external used, compare as-types */
-				if (((peer_sort_type == BGP_PEER_IBGP) &&
-				     !CHECK_FLAG(as_type, AS_INTERNAL)) ||
-				    ((peer_sort_type == BGP_PEER_EBGP) &&
-				     !CHECK_FLAG(as_type, AS_EXTERNAL))) {
-					*as = peer->as;
-					return BGP_ERR_PEER_GROUP_PEER_TYPE_DIFFERENT;
-				}
-			}
-		}
-
 		/* Existing peer's AS number change. */
-		if (((peer->as_type == AS_SPECIFIED) && peer->as != *as)
-		    || (peer->as_type != as_type))
+		if (((peer->as_type == AS_SPECIFIED) && peer->as != *as) ||
+		    (peer->as_type != as_type))
 			peer_as_change(peer, *as, as_type, as_str);
+
+		/*
+		 * Mark that this peer has an explicit remote-as configured, so
+		 * peer_group2peer_config_copy() skips overwriting it if the peer
+		 * is (or later becomes) a group member.
+		 */
+		SET_FLAG(peer->flags_override, PEER_FLAG_REMOTE_AS);
 	} else {
 		if (conf_if)
 			return BGP_ERR_NO_INTERFACE_CONFIG;
@@ -2549,9 +2646,8 @@ static int peer_activate_af(struct peer *peer, afi_t afi, safi_t safi)
 		if (peer_established(peer->connection)) {
 			if (CHECK_FLAG(peer->cap, PEER_CAP_DYNAMIC_RCV)) {
 				peer->afc_adv[afi][safi] = 1;
-				bgp_capability_send(peer, afi, safi,
-						    CAPABILITY_CODE_MP,
-						    CAPABILITY_ACTION_SET);
+				bgp_capability_send(peer->connection, afi, safi,
+						    CAPABILITY_CODE_MP, CAPABILITY_ACTION_SET);
 				if (peer->afc_recv[afi][safi]) {
 					peer->afc_nego[afi][safi] = 1;
 					bgp_announce_route(peer, afi, safi,
@@ -2575,6 +2671,19 @@ static int peer_activate_af(struct peer *peer, afi_t afi, safi_t safi)
 		other = peer->doppelganger;
 		if (other)
 			peer_notify_config_change(other->connection);
+	}
+
+	if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS) {
+		if (peer->connection->su.sa.sa_family == AF_INET6) {
+			SET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV6);
+			UNSET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV4);
+		} else if (peer->connection->su.sa.sa_family == AF_INET) {
+			SET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV4);
+			UNSET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV6);
+		} else {
+			UNSET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV4);
+			UNSET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV6);
+		}
 	}
 
 	return 0;
@@ -2641,6 +2750,24 @@ int peer_activate(struct peer *peer, afi_t afi, safi_t safi)
 		/* connect to table manager */
 		bgp_zebra_init_tm_connect(bgp);
 	}
+
+	/*
+	 * Register with zebra link-state database when the first peer is
+	 * activated for BGP-LS. This allows BGP to receive IGP topology
+	 * updates from ISIS/OSPF for distribution to BGP-LS peers.
+	 */
+	if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS && !bgp_ls_is_registered(bgp)) {
+		if (!bgp_ls_register(bgp)) {
+			zlog_err("BGP-LS: Failed to register with link-state database for instance %s",
+				 bgp->name_pretty);
+			return -1;
+		}
+
+		if (BGP_DEBUG(linkstate, LINKSTATE) || BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("BGP-LS: Registered with link-state database for instance %s (first peer with BGP-LS activated: %s)",
+				   bgp->name_pretty, peer->host);
+	}
+
 	return ret;
 }
 
@@ -2675,9 +2802,8 @@ static bool non_peergroup_deactivate_af(struct peer *peer, afi_t afi,
 			peer->afc_nego[afi][safi] = 0;
 
 			if (peer_active_nego(peer)) {
-				bgp_capability_send(peer, afi, safi,
-						    CAPABILITY_CODE_MP,
-						    CAPABILITY_ACTION_UNSET);
+				bgp_capability_send(peer->connection, afi, safi,
+						    CAPABILITY_CODE_MP, CAPABILITY_ACTION_UNSET);
 				bgp_clear_route(peer, afi, safi);
 				peer->pcount[afi][safi] = 0;
 			} else {
@@ -2685,6 +2811,11 @@ static bool non_peergroup_deactivate_af(struct peer *peer, afi_t afi,
 			}
 		} else
 			peer_notify_config_change(peer->connection);
+	}
+
+	if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS) {
+		UNSET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV4);
+		UNSET_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV6);
 	}
 
 	return false;
@@ -2737,6 +2868,36 @@ int peer_deactivate(struct peer *peer, afi_t afi, safi_t safi)
 		bgp->allocate_mpls_labels[afi][safi_check] = 0;
 		bgp_recalculate_afi_safi_bestpaths(bgp, afi, safi_check);
 	}
+
+	/*
+	 * Unregister from zebra link-state database when the last peer is
+	 * deactivated for BGP-LS. This stops receiving IGP topology updates
+	 * from ISIS/OSPF since no BGP-LS peers remain active.
+	 */
+	if (afi == AFI_BGP_LS && safi == SAFI_BGP_LS && bgp_ls_is_registered(bgp)) {
+		bool last_peer = true;
+
+		for (ALL_LIST_ELEMENTS_RO(bgp->peer, node, tmp_peer)) {
+			if (tmp_peer != peer && tmp_peer->afc[AFI_BGP_LS][SAFI_BGP_LS]) {
+				last_peer = false;
+				break;
+			}
+		}
+
+		if (last_peer) {
+			bgp_ls_withdraw_ted(bgp);
+
+			if (!bgp_ls_unregister(bgp)) {
+				zlog_err("BGP-LS: Failed to unregister from link-state database for instance %s",
+					 bgp->name_pretty);
+			} else {
+				if (BGP_DEBUG(linkstate, LINKSTATE) || BGP_DEBUG(zebra, ZEBRA))
+					zlog_debug("BGP-LS: Unregistered from link-state database for instance %s (last peer with BGP-LS deactivated: %s)",
+						   bgp->name_pretty, peer->host);
+			}
+		}
+	}
+
 	return ret;
 }
 
@@ -2768,7 +2929,7 @@ void peer_nsf_stop(struct peer *peer)
 	bgp_clear_route_all(peer);
 }
 
-/* Delete peer from confguration.
+/* Delete peer from configuration.
  *
  * The peer is moved to a dead-end "Deleted" neighbour-state, to allow
  * it to "cool off" and refcounts to hit 0, at which state it is freed.
@@ -2879,10 +3040,8 @@ int peer_delete(struct peer *peer)
 	/* Password configuration */
 	if (CHECK_FLAG(peer->flags, PEER_FLAG_PASSWORD)) {
 		XFREE(MTYPE_PEER_PASSWORD, peer->password);
-		if (!accept_peer &&
-		    !BGP_CONNECTION_SU_UNSPEC(peer->connection) &&
-		    !CHECK_FLAG(peer->sflags, PEER_STATUS_GROUP) &&
-		    !CHECK_FLAG(peer->flags, PEER_FLAG_DYNAMIC_NEIGHBOR))
+		if (!accept_peer && !BGP_CONNECTION_SU_UNSPEC(peer->connection) &&
+		    !CHECK_FLAG(peer->sflags, PEER_STATUS_GROUP))
 			bgp_md5_unset(peer->connection);
 	}
 
@@ -2950,7 +3109,7 @@ static int peer_group_cmp(struct peer_group *g1, struct peer_group *g2)
 	return strcmp(g1->name, g2->name);
 }
 
-/* Peer group cofiguration. */
+/* Peer group configuration. */
 static struct peer_group *peer_group_new(void)
 {
 	return XCALLOC(MTYPE_PEER_GROUP, sizeof(struct peer_group));
@@ -3019,7 +3178,7 @@ static void peer_group2peer_config_copy(struct peer_group *group,
 	conf = group->conf;
 
 	/* remote-as */
-	if (conf->as)
+	if (conf->as && !CHECK_FLAG(peer->flags_override, PEER_FLAG_REMOTE_AS))
 		peer->as = conf->as;
 
 	/* local-as */
@@ -3161,6 +3320,9 @@ int peer_group_remote_as(struct bgp *bgp, const char *group_name, as_t *as,
 	peer_as_change(group->conf, *as, as_type, as_str);
 
 	for (ALL_LIST_ELEMENTS(group->peer, node, nnode, peer)) {
+		/* Skip peers with an explicit per-peer remote-as override */
+		if (CHECK_FLAG(peer->flags_override, PEER_FLAG_REMOTE_AS))
+			continue;
 		/*
 		 * Re-initiate RA for BGP unnumbered peers when peer group gets
 		 * remote-as configured. This ensures RA is restored after
@@ -3296,6 +3458,10 @@ int peer_group_remote_as_delete(struct peer_group *group)
 		return 0;
 
 	for (ALL_LIST_ELEMENTS(group->peer, node, nnode, peer)) {
+		/* Preserve per-peer remote-as overrides */
+		if (CHECK_FLAG(peer->flags_override, PEER_FLAG_REMOTE_AS))
+			continue;
+
 		if (CHECK_FLAG(peer->flags, PEER_FLAG_CAPABILITY_ENHE))
 			bgp_zebra_terminate_radv(peer->bgp, peer);
 
@@ -3426,7 +3592,6 @@ int peer_group_bind(struct bgp *bgp, union sockunion *su, struct peer *peer,
 			if ((gtype != BGP_PEER_INTERNAL) && (gtype != ptype)) {
 				if (as)
 					*as = peer->as;
-				return BGP_ERR_PEER_GROUP_PEER_TYPE_DIFFERENT;
 			}
 
 			if (gtype == BGP_PEER_INTERNAL)
@@ -3657,6 +3822,7 @@ peer_init:
 
 	bgp->v_update_delay = bm->v_update_delay;
 	bgp->v_establish_wait = bm->v_establish_wait;
+	bgp->v_advertisement_delay = bm->v_advertisement_delay;
 	bgp->default_local_pref = BGP_DEFAULT_LOCAL_PREF;
 	bgp->default_subgroup_pkt_queue_max =
 		BGP_DEFAULT_SUBGROUP_PKT_QUEUE_MAX;
@@ -3674,6 +3840,7 @@ peer_init:
 	bgp->lb_handling = BGP_LINK_BW_ECMP;
 	bgp->reject_as_sets = true;
 	bgp->condition_check_period = DEFAULT_CONDITIONAL_ROUTES_POLL_TIME;
+	bgp->suppress_fib_adv_delay = BGP_DEFAULT_SUPPRESS_FIB_ADV_DELAY;
 	bgp_addpath_init_bgp_data(&bgp->tx_addpath);
 	bgp->fast_convergence = false;
 	bgp->llgr_stale_time = BGP_DEFAULT_LLGR_STALE_TIME;
@@ -3748,6 +3915,9 @@ peer_init:
 	bgp->coalesce_time = BGP_DEFAULT_SUBGROUP_COALESCE_TIME;
 	bgp->default_af[AFI_IP][SAFI_UNICAST] = true;
 
+	/* Initialize IPv6 nexthop prefer-global defaults */
+	bgp_init_ipv6_nexthop_prefer_global(bgp);
+
 	if (!hidden)
 		QOBJ_REG(bgp, bgp);
 
@@ -3761,9 +3931,10 @@ peer_init:
 		bgp_evpn_vrf_es_init(bgp);
 		bgp_pbr_init(bgp);
 		bgp_srv6_init(bgp);
+		bgp_ls_init(bgp);
 	}
 
-	/*initilize global GR FSM */
+	/*initialize global GR FSM */
 	bgp_global_gr_init(bgp);
 
 	memset(&bgp->ebgprequirespolicywarning, 0,
@@ -3773,6 +3944,9 @@ peer_init:
 	pthread_mutex_init(&bgp->peer_errs_mtx, NULL);
 	bgp_peer_conn_errlist_init(&bgp->peer_conn_errlist);
 	bgp_clearing_info_init(&bgp->clearing_list);
+
+	if (bgp && bgp->ls_info && bgp->ls_info->enable_distribution)
+		bgp_ls_originate_bgp_node(bgp);
 
 	return bgp;
 }
@@ -4138,6 +4312,31 @@ void bgp_instance_down(struct bgp *bgp)
 	bgp_set_redist_vrf_bitmaps(bgp, false);
 }
 
+/* Remove this instance's pending zebra announce dests from one global queue. */
+static void bgp_delete_zebra_announce_queue(struct zebra_announce_head *head, struct bgp *bgp)
+{
+	struct bgp_bp_install_node *inode;
+	struct bgp_bp_install_node *inode_next;
+	struct bgp_dest *dest;
+	struct bgp_table *dest_table;
+
+	for (inode = zebra_announce_first(head); inode; inode = inode_next) {
+		inode_next = zebra_announce_next(head, inode);
+		if (inode->type != BGP_BP_INSTALL_ROUTE)
+			continue;
+		dest = inode->ptr;
+		dest_table = bgp_dest_table(dest);
+		if (dest_table->bgp == bgp) {
+			zebra_announce_del(head, inode);
+			bgp->zebra_announce_queue_cnt--;
+			bgp_path_info_unlock(dest->za_bgp_pi);
+			dest->za_inode = NULL;
+			bgp_dest_unlock_node(dest);
+			XFREE(MTYPE_BGP_BP_INSTALL_NODE, inode);
+		}
+	}
+}
+
 /* Delete BGP instance. */
 int bgp_delete(struct bgp *bgp)
 {
@@ -4150,9 +4349,6 @@ int bgp_delete(struct bgp *bgp)
 	int i;
 	uint32_t vni_count;
 	struct bgpevpn *vpn = NULL;
-	struct bgp_dest *dest = NULL;
-	struct bgp_dest *dest_next = NULL;
-	struct bgp_table *dest_table = NULL;
 	struct graceful_restart_info *gr_info;
 	struct bgp *bgp_default = bgp_get_default();
 	struct bgp_clearing_info *cinfo;
@@ -4166,17 +4362,10 @@ int bgp_delete(struct bgp *bgp)
 	 * Iterate the pending dest list and remove all the dest pertaining to
 	 * the bgp under delete.
 	 */
-	b_ann_cnt = zebra_announce_count(&bm->zebra_announce_head);
-	for (dest = zebra_announce_first(&bm->zebra_announce_head); dest;
-	     dest = dest_next) {
-		dest_next = zebra_announce_next(&bm->zebra_announce_head, dest);
-		dest_table = bgp_dest_table(dest);
-		if (dest_table->bgp == bgp) {
-			zebra_announce_del(&bm->zebra_announce_head, dest);
-			bgp_path_info_unlock(dest->za_bgp_pi);
-			bgp_dest_unlock_node(dest);
-		}
-	}
+	b_ann_cnt = zebra_announce_count(&bm->zebra_announce_head) +
+		    zebra_announce_count(&bm->zebra_announce_early_head);
+	bgp_delete_zebra_announce_queue(&bm->zebra_announce_early_head, bgp);
+	bgp_delete_zebra_announce_queue(&bm->zebra_announce_head, bgp);
 
 	/*
 	 * Pop all VPNs yet to be processed for remote routes install if the
@@ -4193,7 +4382,8 @@ int bgp_delete(struct bgp *bgp)
 	}
 
 	if (BGP_DEBUG(zebra, ZEBRA)) {
-		a_ann_cnt = zebra_announce_count(&bm->zebra_announce_head);
+		a_ann_cnt = zebra_announce_count(&bm->zebra_announce_head) +
+			    zebra_announce_count(&bm->zebra_announce_early_head);
 		a_l2_cnt = zebra_l2_vni_count(&bm->zebra_l2_vni_head);
 		zlog_debug("FIFO Cleanup Count during BGP %s deletion :: Zebra Announce - before %u after %u :: BGP L2_VNI - before %u after %u",
 			   bgp->name_pretty, b_ann_cnt, a_ann_cnt, b_l2_cnt, a_l2_cnt);
@@ -4254,6 +4444,7 @@ int bgp_delete(struct bgp *bgp)
 	event_cancel(&bgp->t_maxmed_onstartup);
 	event_cancel(&bgp->t_update_delay);
 	event_cancel(&bgp->t_establish_wait);
+	event_cancel(&bgp->t_advertisement_delay);
 
 	/* If the clearing event is scheduled, there's an extra ref to
 	 * this 'bgp' - ensure we unlock.
@@ -4398,6 +4589,7 @@ int bgp_delete(struct bgp *bgp)
 	/* Free memory allocated with aggregate address configuration. */
 	FOREACH_AFI_SAFI (afi, safi) {
 		struct bgp_aggregate *aggregate = NULL;
+		struct bgp_dest *dest;
 
 		for (dest = bgp_table_top(bgp->aggregate[afi][safi]);
 		     dest; dest = bgp_route_next(dest)) {
@@ -4411,6 +4603,17 @@ int bgp_delete(struct bgp *bgp)
 	}
 
 	bgp_cleanup_routes(bgp);
+
+	if (bm->terminating && bm->bgp_evpn == bgp) {
+		/*
+		 * Clean ES route tables while bgp is still alive,
+		 * then release EVPN VNI bgp_lock references so the
+		 * subsequent bgp_unlock() can drive refcount to
+		 * zero and trigger bgp_free().
+		 */
+		bgp_evpn_es_cleanup_routes(bgp);
+		bgp_evpn_cleanup(bgp);
+	}
 
 	for (afi = 0; afi < AFI_MAX; ++afi) {
 		if (!bgp->vpn_policy[afi].import_redirect_rtlist)
@@ -4550,6 +4753,7 @@ void bgp_free(struct bgp *bgp)
 
 	bgp_evpn_cleanup(bgp);
 	bgp_pbr_cleanup(bgp);
+	bgp_ls_cleanup(bgp);
 
 	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
 		enum vpn_policy_direction dir;
@@ -4701,8 +4905,11 @@ struct peer *peer_create_bind_dynamic_neighbor(struct bgp *bgp,
 	 * want.
 	 */
 	FOREACH_AFI_SAFI (afi, safi) {
-		if (!group->conf->afc[afi][safi])
+		if (!group->conf->afc[afi][safi]) {
+			if (peer->afc[afi][safi])
+				peer_deactivate(peer, afi, safi);
 			continue;
+		}
 		peer->afc[afi][safi] = 1;
 
 		if (!peer_af_find(peer, afi, safi))
@@ -4922,7 +5129,8 @@ enum bgp_peer_active peer_active(struct peer_connection *connection)
 	    || peer->afc[AFI_IP6][SAFI_MPLS_VPN]
 	    || peer->afc[AFI_IP6][SAFI_ENCAP]
 	    || peer->afc[AFI_IP6][SAFI_FLOWSPEC]
-	    || peer->afc[AFI_L2VPN][SAFI_EVPN])
+	    || peer->afc[AFI_L2VPN][SAFI_EVPN]
+	    || peer->afc[AFI_BGP_LS][SAFI_BGP_LS])
 		return BGP_PEER_ACTIVE;
 
 	return BGP_PEER_AF_UNCONFIGURED;
@@ -4943,7 +5151,8 @@ bool peer_active_nego(struct peer *peer)
 	    || peer->afc_nego[AFI_IP6][SAFI_MPLS_VPN]
 	    || peer->afc_nego[AFI_IP6][SAFI_ENCAP]
 	    || peer->afc_nego[AFI_IP6][SAFI_FLOWSPEC]
-	    || peer->afc_nego[AFI_L2VPN][SAFI_EVPN])
+	    || peer->afc_nego[AFI_L2VPN][SAFI_EVPN]
+	    || peer->afc_nego[AFI_BGP_LS][SAFI_BGP_LS])
 		return true;
 	return false;
 }
@@ -5039,7 +5248,7 @@ void peer_change_action(struct peer *peer, afi_t afi, safi_t safi,
 		peer_notify_config_change(peer->connection);
 	} else if (type == peer_change_reset_in) {
 		if (CHECK_FLAG(peer->cap, PEER_CAP_REFRESH_RCV))
-			bgp_route_refresh_send(peer, afi, safi, 0, 0, 0,
+			bgp_route_refresh_send(peer->connection, afi, safi, 0, 0, 0,
 					       BGP_ROUTE_REFRESH_NORMAL);
 		else {
 			if ((peer->doppelganger) &&
@@ -5052,7 +5261,7 @@ void peer_change_action(struct peer *peer, afi_t afi, safi_t safi,
 		}
 	}
 	if (type == peer_change_best_path && safi == SAFI_MPLS_VPN)
-		/* re-run best path on incomin BGP updated from peer */
+		/* re-run best path on incoming BGP updated from peer */
 		peer_vpn_change_bestpath(peer, afi);
 	if (type == peer_change_reset_out || type == peer_change_best_path) {
 		paf = peer_af_find(peer, afi, safi);
@@ -5108,7 +5317,7 @@ static const struct peer_flag_action peer_flag_action_list[] = {
 	{ PEER_FLAG_CAPABILITY_SOFT_VERSION_OLD, 0, peer_change_none },
 	{ PEER_FLAG_CAPABILITY_SOFT_VERSION_NEW, 0, peer_change_none },
 	{ PEER_FLAG_CAPABILITY_FQDN, 0, peer_change_none },
-	{ PEER_FLAG_AS_LOOP_DETECTION, 0, peer_change_none },
+	{ PEER_FLAG_AS_LOOP_DETECTION, 0, peer_change_reset },
 	{ PEER_FLAG_EXTENDED_LINK_BANDWIDTH, 0, peer_change_none },
 	{ PEER_FLAG_LONESOUL, 0, peer_change_reset_out },
 	{ PEER_FLAG_TCP_MSS, 0, peer_change_none },
@@ -6445,7 +6654,7 @@ void peer_tcp_mss_unset(struct peer *peer)
 
 	/*
 	 * Remove flag and configuration from all peer-group members, unless
-	 * they are explicitely overriding peer-group configuration.
+	 * they are explicitly overriding peer-group configuration.
 	 */
 	for (ALL_LIST_ELEMENTS(peer->group->peer, node, nnode, member)) {
 		/* Skip peers with overridden configuration. */
@@ -6479,7 +6688,7 @@ void peer_on_policy_change(struct peer *peer, afi_t afi, safi_t safi,
 			return;
 
 		if (CHECK_FLAG(peer->cap, PEER_CAP_REFRESH_RCV))
-			bgp_route_refresh_send(peer, afi, safi, 0, 0, 0,
+			bgp_route_refresh_send(peer->connection, afi, safi, 0, 0, 0,
 					       BGP_ROUTE_REFRESH_NORMAL);
 	}
 }
@@ -6955,8 +7164,7 @@ void peer_interface_unset(struct peer *peer)
 }
 
 /* Allow-as in.  */
-int peer_allowas_in_set(struct peer *peer, afi_t afi, safi_t safi,
-			int allow_num, int origin)
+int peer_allowas_in_set(struct peer *peer, afi_t afi, safi_t safi, int allow_num, bool origin)
 {
 	struct peer *member;
 	struct listnode *node, *nnode;
@@ -8724,7 +8932,7 @@ static void peer_reset_message_stats(struct peer *peer)
  */
 static void peer_clear_capabilities(struct peer *peer, afi_t afi, safi_t safi)
 {
-	bgp_capability_send(peer, afi, safi, CAPABILITY_CODE_FQDN,
+	bgp_capability_send(peer->connection, afi, safi, CAPABILITY_CODE_FQDN,
 			    CAPABILITY_ACTION_SET);
 }
 
@@ -8795,25 +9003,21 @@ int peer_clear_soft(struct peer *peer, afi_t afi, safi_t safi,
 			if (filter->plist[FILTER_IN].plist) {
 				if (CHECK_FLAG(peer->af_sflags[afi][safi],
 					       PEER_STATUS_ORF_PREFIX_SEND))
-					bgp_route_refresh_send(
-						peer, afi, safi, prefix_type,
-						REFRESH_DEFER, 1,
-						BGP_ROUTE_REFRESH_NORMAL);
-				bgp_route_refresh_send(
-					peer, afi, safi, prefix_type,
-					REFRESH_IMMEDIATE, 0,
-					BGP_ROUTE_REFRESH_NORMAL);
+					bgp_route_refresh_send(peer->connection, afi, safi,
+							       prefix_type, REFRESH_DEFER, 1,
+							       BGP_ROUTE_REFRESH_NORMAL);
+				bgp_route_refresh_send(peer->connection, afi, safi, prefix_type,
+						       REFRESH_IMMEDIATE, 0,
+						       BGP_ROUTE_REFRESH_NORMAL);
 			} else {
 				if (CHECK_FLAG(peer->af_sflags[afi][safi],
 					       PEER_STATUS_ORF_PREFIX_SEND))
-					bgp_route_refresh_send(
-						peer, afi, safi, prefix_type,
-						REFRESH_IMMEDIATE, 1,
-						BGP_ROUTE_REFRESH_NORMAL);
+					bgp_route_refresh_send(peer->connection, afi, safi,
+							       prefix_type, REFRESH_IMMEDIATE, 1,
+							       BGP_ROUTE_REFRESH_NORMAL);
 				else
-					bgp_route_refresh_send(
-						peer, afi, safi, 0, 0, 0,
-						BGP_ROUTE_REFRESH_NORMAL);
+					bgp_route_refresh_send(peer->connection, afi, safi, 0, 0,
+							       0, BGP_ROUTE_REFRESH_NORMAL);
 			}
 			return 0;
 		}
@@ -8828,9 +9032,8 @@ int peer_clear_soft(struct peer *peer, afi_t afi, safi_t safi,
 			   refresh
 			   message to the peer. */
 			if (CHECK_FLAG(peer->cap, PEER_CAP_REFRESH_RCV))
-				bgp_route_refresh_send(
-					peer, afi, safi, 0, 0, 0,
-					BGP_ROUTE_REFRESH_NORMAL);
+				bgp_route_refresh_send(peer->connection, afi, safi, 0, 0, 0,
+						       BGP_ROUTE_REFRESH_NORMAL);
 			else
 				return BGP_ERR_SOFT_RECONFIG_UNCONFIGURED;
 		}
@@ -8906,6 +9109,7 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	pthread_mutex_init(&bm->peer_connection_mtx, NULL);
 
 	zebra_announce_init(&bm->zebra_announce_head);
+	zebra_announce_init(&bm->zebra_announce_early_head);
 	zebra_l2_vni_init(&bm->zebra_l2_vni_head);
 	bm->bgp = list_new();
 	bm->listen_sockets = list_new();
@@ -8920,6 +9124,7 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	bm->terminating = false;
 	bm->socket_buffer = buffer_size;
 	bm->wait_for_fib = false;
+	bm->suppress_fib_adv_delay = BGP_DEFAULT_SUPPRESS_FIB_ADV_DELAY;
 	bm->ip_tos = IPTOS_PREC_INTERNETCONTROL;
 	bm->inq_limit = BM_DEFAULT_Q_LIMIT;
 	bm->outq_limit = BM_DEFAULT_Q_LIMIT;
@@ -9381,19 +9586,16 @@ static uint32_t peer_clearing_hashfn(const struct peer *p1)
 
 /*
  * Free a clearing batch: this really just does the memory cleanup; the
- * clearing code is expected to manage the peer, dest, table, etc refcounts
+ * clearing code is expected to manage the peer, etc refcounts within
+ * the batch.
  */
 static void bgp_clearing_batch_free(struct bgp *bgp,
 				    struct bgp_clearing_info **pinfo)
 {
 	struct bgp_clearing_info *cinfo = *pinfo;
-	struct bgp_clearing_dest *destinfo;
 
 	if (bgp_clearing_info_anywhere(cinfo))
 		bgp_clearing_info_del(&bgp->clearing_list, cinfo);
-
-	while ((destinfo = bgp_clearing_destlist_pop(&cinfo->destlist)) != NULL)
-		XFREE(MTYPE_CLEARING_BATCH, destinfo);
 
 	bgp_clearing_hash_fini(&cinfo->peers);
 
@@ -9428,13 +9630,13 @@ void bgp_clearing_batch_begin(struct bgp *bgp)
 	cinfo->bgp = bgp;
 	cinfo->id = bm->peer_clearing_batch_id++;
 
-	/* Init hash of peers and list of dests */
+	/* Init hash of peers */
 	bgp_clearing_hash_init(&cinfo->peers);
-	bgp_clearing_destlist_init(&cinfo->destlist);
 
 	/* Batch is open for more peers */
 	SET_FLAG(cinfo->flags, BGP_CLEARING_INFO_FLAG_OPEN);
 
+	/* coverity[leaked_storage] - cinfo is stored in clearing_list */
 	bgp_clearing_info_add_head(&bgp->clearing_list, cinfo);
 }
 
@@ -9500,22 +9702,11 @@ bool bgp_clearing_batch_check_peer(struct bgp_clearing_info *cinfo,
 }
 
 /*
- * Check whether a clearing batch has any dests to process
- */
-bool bgp_clearing_batch_dests_present(struct bgp_clearing_info *cinfo)
-{
-	return (bgp_clearing_destlist_count(&cinfo->destlist) > 0);
-}
-
-/*
  * Done with a peer clearing batch; deal with refcounts, free memory
  */
 void bgp_clearing_batch_completed(struct bgp_clearing_info *cinfo)
 {
 	struct peer *peer;
-	struct bgp_dest *dest;
-	struct bgp_clearing_dest *destinfo;
-	struct bgp_table *table;
 	uint32_t idx = 0;
 
 	if (bgp_debug_neighbor_events(NULL))
@@ -9529,53 +9720,8 @@ void bgp_clearing_batch_completed(struct bgp_clearing_info *cinfo)
 	while ((peer = bgp_clearing_hash_pop_all(&cinfo->peers, &idx)) != NULL)
 		bgp_clearing_peer_done(peer);
 
-	/* Remove any dests/prefixes and unlock */
-	destinfo = bgp_clearing_destlist_pop(&cinfo->destlist);
-	while (destinfo) {
-		dest = destinfo->dest;
-		XFREE(MTYPE_CLEARING_BATCH, destinfo);
-
-		table = bgp_dest_table(dest);
-		bgp_dest_unlock_node(dest);
-		bgp_table_unlock(table);
-
-		destinfo = bgp_clearing_destlist_pop(&cinfo->destlist);
-	}
-
 	/* Free memory */
 	bgp_clearing_batch_free(cinfo->bgp, &cinfo);
-}
-
-/*
- * Add a prefix/dest to a clearing batch
- */
-void bgp_clearing_batch_add_dest(struct bgp_clearing_info *cinfo,
-				 struct bgp_dest *dest)
-{
-	struct bgp_clearing_dest *destinfo;
-
-	destinfo = XCALLOC(MTYPE_CLEARING_BATCH,
-			   sizeof(struct bgp_clearing_dest));
-
-	destinfo->dest = dest;
-	bgp_clearing_destlist_add_tail(&cinfo->destlist, destinfo);
-}
-
-/*
- * Return the next dest for batch clear processing
- */
-struct bgp_dest *bgp_clearing_batch_next_dest(struct bgp_clearing_info *cinfo)
-{
-	struct bgp_clearing_dest *destinfo;
-	struct bgp_dest *dest = NULL;
-
-	destinfo = bgp_clearing_destlist_pop(&cinfo->destlist);
-	if (destinfo) {
-		dest = destinfo->dest;
-		XFREE(MTYPE_CLEARING_BATCH, destinfo);
-	}
-
-	return dest;
 }
 
 /* If a clearing batch is available for 'peer', add it and return 'true',

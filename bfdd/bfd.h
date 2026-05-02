@@ -129,7 +129,7 @@ struct bfd_pkt {
 };
 
 /*
- * Format of authentification.
+ * Format of authentication.
  */
 struct bfd_auth {
 	uint8_t type;
@@ -274,6 +274,7 @@ struct bfd_key {
 } __attribute__((packed));
 
 struct bfd_session_stats {
+	uint64_t rx_bad_ctrl_pkt;
 	uint64_t rx_ctrl_pkt;
 	uint64_t tx_ctrl_pkt;
 	uint64_t rx_echo_pkt;
@@ -326,6 +327,9 @@ struct bfd_config_timers {
 	uint32_t desired_min_echo_tx;
 	uint32_t required_min_echo_rx;
 };
+
+/** BFD profiles list. */
+extern struct bfdproflist bplist;
 
 #define BFD_RTT_SAMPLE 8
 
@@ -481,6 +485,12 @@ struct bfd_vrf_global {
 	struct vrf *vrf;
 
 	struct event *bg_ev[7];
+
+	/** Number of active BFD sessions using this VRF's sockets. */
+	int bg_session_count;
+
+	/** Number of SBFD reflectors using this VRF's sockets. */
+	int bg_reflector_count;
 };
 
 /* Forward declaration of data plane context struct. */
@@ -538,7 +548,7 @@ void socket_close(int *s);
 /*
  * bfd_packet.c
  *
- * Contains the code related with receiving/seding, packing/unpacking BFD data.
+ * Contains the code related with receiving/sending, packing/unpacking BFD data.
  */
 int bp_set_ttlv6(int sd, uint8_t value);
 int bp_set_ttl(int sd, uint8_t value);
@@ -608,7 +618,7 @@ int bfd_session_enable(struct bfd_session *bs);
 void bfd_session_disable(struct bfd_session *bs);
 struct bfd_session *ptm_bfd_sess_new(struct bfd_peer_cfg *bpc);
 int ptm_bfd_sess_del(struct bfd_peer_cfg *bpc);
-void ptm_bfd_sess_dn(struct bfd_session *bfd, uint8_t diag);
+void ptm_bfd_sess_dn(struct bfd_session *bfd, uint8_t diag, bool notify_admin_down);
 void ptm_bfd_sess_up(struct bfd_session *bfd);
 void ptm_bfd_echo_stop(struct bfd_session *bfd);
 void ptm_bfd_echo_start(struct bfd_session *bfd);
@@ -701,6 +711,8 @@ void bfd_initialize(void);
 void bfd_shutdown(void);
 void bfd_vrf_init(const char *context);
 void bfd_vrf_terminate(void);
+int bfd_vrf_start_sockets(struct bfd_vrf_global *bvrf);
+void bfd_vrf_stop_sockets(struct bfd_vrf_global *bvrf);
 struct bfd_vrf_global *bfd_vrf_look_by_session(struct bfd_session *bfd);
 struct bfd_session *bfd_id_lookup(uint32_t id);
 struct bfd_session *bfd_key_lookup(struct bfd_key *key);
@@ -759,7 +771,7 @@ struct bfd_profile *bfd_profile_lookup(const char *name);
  *
  * \param bp the BFD profile.
  */
-void bfd_profile_free(struct bfd_profile *bp);
+void bfd_profile_free(struct bfd_profile *bp, bool suppress_profile);
 
 /**
  * Apply a profile configuration to an existing BFD session. The non default

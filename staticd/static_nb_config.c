@@ -459,6 +459,52 @@ static int static_nexthop_mpls_label_modify(struct nb_cb_modify_args *args)
 	return NB_OK;
 }
 
+static int static_nexthop_weight_modify(struct nb_cb_modify_args *args)
+{
+	struct static_nexthop *nh;
+	uint16_t weight;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		nh = nb_running_get_entry(args->dnode, NULL, true);
+		weight = nh->weight;
+		nh->weight = yang_dnode_get_uint16(args->dnode, NULL);
+
+		if (weight != nh->weight)
+			nh->state = STATIC_START;
+		break;
+	}
+
+	return NB_OK;
+}
+
+static int static_nexthop_weight_destroy(struct nb_cb_destroy_args *args)
+{
+	struct static_nexthop *nh;
+	uint16_t weight;
+
+	switch (args->event) {
+	case NB_EV_VALIDATE:
+	case NB_EV_PREPARE:
+	case NB_EV_ABORT:
+		break;
+	case NB_EV_APPLY:
+		nh = nb_running_get_entry(args->dnode, NULL, true);
+		weight = nh->weight;
+		nh->weight = 0;
+
+		if (weight != nh->weight)
+			nh->state = STATIC_START;
+		break;
+	}
+
+	return NB_OK;
+}
+
 static int static_nexthop_onlink_modify(struct nb_cb_modify_args *args)
 {
 	struct static_nexthop *nh;
@@ -769,6 +815,26 @@ int routing_control_plane_protocols_control_plane_protocol_staticd_route_list_pa
 
 /*
  * XPath:
+ * /frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-staticd:staticd/route-list/path-list/frr-nexthops/nexthop/weight
+ */
+int routing_control_plane_protocols_control_plane_protocol_staticd_route_list_path_list_frr_nexthops_nexthop_weight_modify(
+	struct nb_cb_modify_args *args)
+{
+	return static_nexthop_weight_modify(args);
+}
+
+/*
+ * XPath:
+ * /frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-staticd:staticd/route-list/path-list/frr-nexthops/nexthop/weight
+ */
+int routing_control_plane_protocols_control_plane_protocol_staticd_route_list_path_list_frr_nexthops_nexthop_weight_destroy(
+	struct nb_cb_destroy_args *args)
+{
+	return static_nexthop_weight_destroy(args);
+}
+
+/*
+ * XPath:
  * /frr-routing:routing/control-plane-protocols/control-plane-protocol/frr-staticd:staticd/route-list/path-list/frr-nexthops/nexthop/onlink
  */
 int routing_control_plane_protocols_control_plane_protocol_staticd_route_list_path_list_frr_nexthops_nexthop_onlink_modify(
@@ -856,7 +922,7 @@ int routing_control_plane_protocols_control_plane_protocol_staticd_route_list_pa
 	/*
 	 * No operation is required in this call back.
 	 * nexthop_srv6_segs_stack_entry_destroy() will take care
-	 * to reset the seg vaue.
+	 * to reset the seg value.
 	 */
 	switch (args->event) {
 	case NB_EV_VALIDATE:
@@ -946,7 +1012,7 @@ int routing_control_plane_protocols_control_plane_protocol_staticd_route_list_pa
 	/*
 	 * No operation is required in this call back.
 	 * nexthop_mpls_label_stack_entry_destroy() will take care
-	 * to reset the label vaue.
+	 * to reset the label value.
 	 */
 	switch (args->event) {
 	case NB_EV_VALIDATE:

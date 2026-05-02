@@ -37,7 +37,7 @@
 #include "zebra/zebra_errors.h"
 
 DEFINE_MTYPE_STATIC(ZEBRA, RNH, "Nexthop tracking object");
-DEFINE_MTYPE_STATIC(ZEBRA, RNH_CONTAINER, "RNH container for per-client tracking");
+DEFINE_MTYPE_STATIC(ZEBRA, RNH_CONTAINER, "RNH per-client");
 
 /* Container for multiple rnh structures per prefix.
  * This is stored in route_node->info in the rnh_table.
@@ -817,7 +817,14 @@ static void zebra_rnh_eval_nexthop_entry(struct zebra_vrf *zvrf, afi_t afi,
 	}
 	zebra_rnh_store_in_routing_table(rnh);
 
-	if (state_changed || force) {
+	if (state_changed || force ||
+	    (re && CHECK_FLAG(re->status, ROUTE_ENTRY_SEND_NHT_REMOVAL))) {
+		if (re && CHECK_FLAG(re->status, ROUTE_ENTRY_SEND_NHT_REMOVAL)) {
+			struct rnh rnh_empty = *rnh;
+
+			rnh_empty.state = NULL;
+			zebra_rnh_notify_protocol_clients(zvrf, afi, nrn, &rnh_empty, prn, NULL);
+		}
 		/* NOTE: Use the "copy" of resolving route stored in 'rnh' i.e.,
 		 * rnh->state.
 		 */

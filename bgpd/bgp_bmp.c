@@ -8,7 +8,7 @@
 
 #include "log.h"
 #include "stream.h"
-#include "sockunion.h"
+#include "sockopt.h"
 #include "command.h"
 #include "prefix.h"
 #include "frrevent.h"
@@ -1118,7 +1118,7 @@ static struct stream *bmp_update(const struct prefix *p, struct prefix_rd *prd,
 
 	/* 5: Encode all the attributes, except MP_REACH_NLRI attr. */
 	total_attr_len = bgp_packet_attribute(NULL, peer, s, attr, &vecarr, NULL, afi, safi, peer,
-					      NULL, NULL, 0, 0, 0, 0, NULL);
+					      NULL, NULL, 0, 0, 0, 0, NULL, NULL);
 
 	/* space check? */
 
@@ -1132,8 +1132,7 @@ static struct stream *bmp_update(const struct prefix *p, struct prefix_rd *prd,
 
 		mpattrlen_pos = bgp_packet_mpattr_start(s, peer, afi, safi,
 				&vecarr, attr);
-		bgp_packet_mpattr_prefix(s, afi, safi, p, prd, label,
-					 num_labels, 0, 0, attr);
+		bgp_packet_mpattr_prefix(s, afi, safi, p, prd, label, num_labels, 0, 0, attr, NULL);
 		bgp_packet_mpattr_end(s, mpattrlen_pos);
 		total_attr_len += stream_get_endp(s) - p1;
 	}
@@ -1171,8 +1170,7 @@ static struct stream *bmp_withdraw(const struct prefix *p,
 		mp_start = stream_get_endp(s);
 		mplen_pos = bgp_packet_mpunreach_start(s, afi, safi);
 
-		bgp_packet_mpunreach_prefix(s, p, afi, safi, prd, NULL, 0, 0, 0,
-					    NULL);
+		bgp_packet_mpunreach_prefix(s, p, afi, safi, prd, NULL, 0, 0, 0, NULL, NULL);
 		/* Set the mp_unreach attr's length */
 		bgp_packet_mpunreach_end(s, mplen_pos);
 
@@ -1408,7 +1406,7 @@ afibreak:
 					memset(&bmp->syncpos, 0,
 					       sizeof(bmp->syncpos));
 					bmp->syncpos.family = afi2family(afi);
-					/* check whethere there is a valid
+					/* check whether there is a valid
 					 * next mid-layer table, otherwise
 					 * declare table completed (eor)
 					 */
@@ -2215,7 +2213,7 @@ static void bmp_bgp_peer_vrf(struct bmp_bgp_peer *bbpeer, struct bgp *bgp)
 	else
 		local_as = peer->local_as;
 
-	s = bgp_open_make(peer, peer->connection, send_holdtime, local_as, &peer->local_id);
+	s = bgp_open_make(peer->connection, send_holdtime, local_as, &peer->local_id);
 	open_len = stream_get_endp(s);
 
 	bbpeer->open_rx_len = open_len;
@@ -2227,7 +2225,7 @@ static void bmp_bgp_peer_vrf(struct bmp_bgp_peer *bbpeer, struct bgp *bgp)
 	stream_free(s);
 
 	/* rfc9069#section-5.2 : Received OPEN Message: Repeat of the same sent OPEN message */
-	s = bgp_open_make(peer, peer->connection, send_holdtime, local_as, &peer->local_id);
+	s = bgp_open_make(peer->connection, send_holdtime, local_as, &peer->local_id);
 	open_len = stream_get_endp(s);
 	bbpeer->open_tx_len = open_len;
 	if (bbpeer->open_tx)

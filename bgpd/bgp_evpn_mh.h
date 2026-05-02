@@ -54,7 +54,7 @@ struct bgp_evpn_es_frag {
  * - Local ESs are received from zebra (BGP_EVPNES_LOCAL)
  * - Remotes ESs are implicitly created (by reference) by a remote ES-EVI
  *   (BGP_EVPNES_REMOTE)
- * - An ES can be simultaneously LOCAL and REMOTE; infact all LOCAL ESs are
+ * - An ES can be simultaneously LOCAL and REMOTE; in fact all LOCAL ESs are
  *   expected to have REMOTE ES peers.
  */
 struct bgp_evpn_es {
@@ -225,6 +225,8 @@ struct bgp_evpn_es_evi {
 /* created via a remote VTEP imported by BGP */
 #define BGP_EVPNES_EVI_REMOTE           (1 << 1)
 #define BGP_EVPNES_EVI_INCONS_VTEP_LIST (1 << 2)
+/* deferred route cleanup needed when VRF becomes available */
+#define BGP_EVPNES_EVI_SWEEP_LOCAL_ROUTES (1 << 3)
 
 	/* memory used for adding the es_evi to es_evi->vpn->es_evi_rb_tree */
 	RB_ENTRY(bgp_evpn_es_evi) rb_node;
@@ -427,6 +429,7 @@ bgp_evpn_remote_es_evi_del(struct bgp *bgp, struct bgpevpn *vpn,
 			   struct bgp_path_info *pi);
 extern void bgp_evpn_mh_init(void);
 extern void bgp_evpn_mh_finish(void);
+extern void bgp_evpn_es_cleanup_routes(struct bgp *bgp);
 void bgp_evpn_vni_es_init(struct bgpevpn *vpn);
 void bgp_evpn_vni_es_cleanup(struct bgpevpn *vpn);
 void bgp_evpn_es_show_esi(struct vty *vty, esi_t *esi, bool uj);

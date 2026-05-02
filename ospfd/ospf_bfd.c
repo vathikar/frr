@@ -50,6 +50,20 @@ static void ospf_bfd_session_change(struct bfd_session_params *bsp,
 {
 	struct ospf_neighbor *nbr = arg;
 
+	/*
+	 * Handle Admin Down from peer separately.
+	 * When BFD receives Admin Down from peer, we should NOT tear down
+	 * the OSPF neighbor. The peer is administratively shutting down BFD,
+	 * but the OSPF adjacency should remain up.
+	 */
+	if (bss->state == BSS_ADMIN_DOWN && bss->previous_state == BSS_UP) {
+		if (IS_DEBUG_OSPF(bfd, BFD_LIB))
+			zlog_debug("%s: NSM[%s:%pI4]: BFD received Admin Down from peer - OSPF adjacency maintained",
+				   __func__, IF_NAME(nbr->oi), &nbr->address.u.prefix4);
+		/* Don't tear down OSPF neighbor, just log the event */
+		return;
+	}
+
 	/* BFD peer went down. */
 	if (bss->state == BFD_STATUS_DOWN
 	    && bss->previous_state == BFD_STATUS_UP) {
@@ -81,7 +95,10 @@ void ospf_neighbor_bfd_apply(struct ospf_neighbor *nbr)
 	/* New BFD session. */
 	if (nbr->bfd_session == NULL) {
 		nbr->bfd_session = bfd_sess_new(ospf_bfd_session_change, nbr);
-		bfd_sess_set_ipv4_addrs(nbr->bfd_session, NULL, &nbr->src);
+		/* Pass local interface address as source (like BGP does with su_local) */
+		bfd_sess_set_ipv4_addrs(nbr->bfd_session,
+					oi->address ? &oi->address->u.prefix4 : NULL,  /* local source */
+					&nbr->src);                /* remote dest */
 		bfd_sess_set_interface(nbr->bfd_session, oi->ifp->name);
 		bfd_sess_set_vrf(nbr->bfd_session, oi->ospf->vrf_id);
 	}

@@ -196,7 +196,7 @@ ecommunity_uniq_sort_internal(struct ecommunity *ecom,
 	return new;
 }
 
-/* This function takes pointer to Extended Communites structure then
+/* This function takes pointer to Extended Communities structure then
  * create a new Extended Communities structure by uniq and sort each
  * Extended Communities value.
  */
@@ -205,7 +205,7 @@ struct ecommunity *ecommunity_uniq_sort(struct ecommunity *ecom)
 	return ecommunity_uniq_sort_internal(ecom, ECOMMUNITY_SIZE);
 }
 
-/* Parse Extended Communites Attribute in BGP packet.  */
+/* Parse Extended Communities Attribute in BGP packet.  */
 static struct ecommunity *ecommunity_parse_internal(uint8_t *pnt,
 						    unsigned short length,
 						    unsigned short size_ecom,
@@ -682,9 +682,10 @@ static const char *ecommunity_gettoken(const char *str, void *eval_ptr,
 	/* IPv6 case : look for last ':' */
 	if (*token == ecommunity_token_rt6 ||
 	    *token == ecommunity_token_val6) {
-		char *limit;
+		const char *limit;
 
-		limit = endptr = strrchr(p, ':');
+		limit = strrchr(p, ':');
+		endptr = (char *)limit;
 		if (!endptr)
 			goto error;
 
@@ -950,7 +951,7 @@ static int ecommunity_rt_soo_str_internal(char *buf, size_t bufsz,
 	const char *prefix;
 	char buf_local[INET6_ADDRSTRLEN];
 
-	/* For parse Extended Community attribute tupple. */
+	/* For parse Extended Community attribute tuple. */
 	struct ecommunity_as eas;
 	struct ecommunity_ip eip;
 	struct ecommunity_ip6 eip6;
@@ -988,7 +989,7 @@ static int ecommunity_rt_soo_str_internal(char *buf, size_t bufsz,
 				       eas.val);
 		} else {
 			/* this is an IPv6 ext community
-			 * first 16 bytes stands for IPv6 addres
+			 * first 16 bytes stands for IPv6 address
 			 */
 			memcpy(&eip6.ip, pnt, 16);
 			pnt += 16;
@@ -1184,7 +1185,7 @@ static char *_ecommunity_ecom2str(struct ecommunity *ecom, int format, int filte
 		uint8_t *end = data + ecom->unit_size;
 		size_t len = end - data;
 
-		/* Sanity check for extended communities lenght, to avoid
+		/* Sanity check for extended communities length, to avoid
 		 * overrun when dealing with bits, e.g. ptr_get_be64().
 		 */
 		if (len < ecom->unit_size) {
@@ -1345,25 +1346,34 @@ static char *_ecommunity_ecom2str(struct ecommunity *ecom, int format, int filte
 
 				++pnt;
 				memcpy(&flags, pnt, 2);
+				flags = ntohs(flags);
 				++pnt;
 				++pnt;
 
 				memcpy(&l2mtu, pnt, 2);
+				l2mtu = ntohs(l2mtu);
 
-				snprintf(encbuf, sizeof(encbuf),
-					 "L2: P flag:%c, B Flag %c, C word %c, MTU %d",
+				snprintf(encbuf, sizeof(encbuf), "L2: Cflags %s%s%s%s, MTU %d",
+					 (CHECK_FLAG(flags,
+						     ECOMMUNITY_EVPN_SUBTYPE_LAYER2_ATTR_CONTROL_WORD_FLAG) ||
+					  CHECK_FLAG(flags,
+						     ECOMMUNITY_EVPN_SUBTYPE_LAYER2_ATTR_PRIMARY_PE_FLAG) ||
+					  CHECK_FLAG(flags,
+						     ECOMMUNITY_EVPN_SUBTYPE_LAYER2_ATTR_BACKUP_PE_FLAG))
+						 ? ""
+						 : "none",
 					 CHECK_FLAG(flags,
 						    ECOMMUNITY_EVPN_SUBTYPE_LAYER2_ATTR_PRIMARY_PE_FLAG)
-						 ? 'Y'
-						 : 'N',
+						 ? "P"
+						 : "",
 					 CHECK_FLAG(flags,
 						    ECOMMUNITY_EVPN_SUBTYPE_LAYER2_ATTR_BACKUP_PE_FLAG)
-						 ? 'Y'
-						 : 'N',
+						 ? "B"
+						 : "",
 					 CHECK_FLAG(flags,
 						    ECOMMUNITY_EVPN_SUBTYPE_LAYER2_ATTR_CONTROL_WORD_FLAG)
-						 ? 'Y'
-						 : 'N',
+						 ? "C"
+						 : "",
 					 l2mtu);
 			} else
 				unk_ecom = true;
@@ -1570,7 +1580,7 @@ bool ecommunity_match(const struct ecommunity *ecom1,
 		return false;
 }
 
-/* return last occurence of color */
+/* return last occurrence of color */
 /* it will be the greatest color value */
 extern uint32_t ecommunity_select_color(const struct ecommunity *ecom)
 {
@@ -1593,7 +1603,7 @@ extern uint32_t ecommunity_select_color(const struct ecommunity *ecom)
 }
 
 
-/* return first occurence of type */
+/* return first occurrence of type */
 extern struct ecommunity_val *ecommunity_lookup(const struct ecommunity *ecom,
 						uint8_t type, uint8_t subtype)
 {
@@ -2041,13 +2051,14 @@ const uint8_t *ecommunity_linkbw_present(struct ecommunity *ecom, uint64_t *bw)
 		const uint8_t *end = data + ecom->unit_size;
 		size_t len = end - data;
 
-		/* Sanity check for extended communities lenght, to avoid
+		/* Sanity check for extended communities length, to avoid
 		 * overrun when dealing with bits, e.g. ptr_get_be64().
 		 */
 		if (len < ecom->unit_size)
 			return NULL;
 
-		if ((type == ECOMMUNITY_ENCODE_AS) && sub_type == ECOMMUNITY_LINK_BANDWIDTH) {
+		if (CHECK_FLAG(type, ~ECOMMUNITY_FLAG_NON_TRANSITIVE) == ECOMMUNITY_ENCODE_AS &&
+		    sub_type == ECOMMUNITY_LINK_BANDWIDTH) {
 			uint32_t bwval;
 
 			pnt += 2; /* bandwidth is encoded as AS:val */
@@ -2059,7 +2070,8 @@ const uint8_t *ecommunity_linkbw_present(struct ecommunity *ecom, uint64_t *bw)
 							 : ieee_float_uint32_to_uint32(
 								   bwval));
 			return data;
-		} else if (type == ECOMMUNITY_ENCODE_AS4 &&
+		} else if (CHECK_FLAG(type, ~ECOMMUNITY_FLAG_NON_TRANSITIVE) ==
+				   ECOMMUNITY_ENCODE_AS4 &&
 			   sub_type == ECOMMUNITY_EXTENDED_LINK_BANDWIDTH) {
 			uint64_t bwval;
 

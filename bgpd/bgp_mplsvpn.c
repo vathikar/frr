@@ -230,7 +230,7 @@ int bgp_nlri_parse_vpn(struct peer *peer, struct attr *attr,
 			EC_BGP_UPDATE_RCV,
 			"%s [Error] Update packet error / VPN (%zu data remaining after parsing)",
 			peer->host, STREAM_READABLE(data));
-		return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+		ret = BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
 	}
 
 	goto done;
@@ -821,7 +821,7 @@ void ensure_vrf_tovpn_sid_per_af(struct bgp *bgp_vpn, struct bgp *bgp_vrf,
 		return;
 
 	/*
-	 * skip when bgp vpn instance ins't allocated
+	 * skip when bgp vpn instance isn't allocated
 	 * or srv6 locator isn't allocated
 	 */
 	if (!bgp_vpn)
@@ -911,7 +911,7 @@ void ensure_vrf_tovpn_sid_per_vrf(struct bgp *bgp_vpn, struct bgp *bgp_vrf)
 		return;
 
 	/*
-	 * skip when bgp vpn instance ins't allocated
+	 * skip when bgp vpn instance isn't allocated
 	 * or srv6 locator isn't allocated
 	 */
 	if (!bgp_vpn)
@@ -1567,7 +1567,7 @@ _vpn_leak_from_vrf_get_per_nexthop_label(struct bgp_path_info *pi,
 		nh_pfx = &nh_gate;
 		break;
 	case NEXTHOP_TYPE_IFINDEX:
-		/* the nexthop is direcly connected */
+		/* the nexthop is directly connected */
 		nh_pfx = &bnc->prefix;
 		break;
 	case NEXTHOP_TYPE_BLACKHOLE:
@@ -1965,10 +1965,11 @@ void vpn_leak_from_vrf_update(struct bgp *to_bgp,	     /* to */
 	if (from_bgp->vpn_policy[afi].rmap[BGP_VPN_POLICY_DIR_TOVPN]) {
 		struct bgp_path_info info;
 		route_map_result_t ret;
+		struct bgp_path_info_extra path_extra;
+		struct peer *peer = path_vrf->peer ? path_vrf->peer : to_bgp->peer_self;
 
-		memset(&info, 0, sizeof(info));
-		info.peer = path_vrf->peer ? path_vrf->peer : to_bgp->peer_self;
-		info.attr = &static_attr;
+		prep_for_rmap_apply(&info, &path_extra, path_vrf->net, path_vrf, peer, NULL,
+				    &static_attr);
 		ret = route_map_apply(from_bgp->vpn_policy[afi]
 					      .rmap[BGP_VPN_POLICY_DIR_TOVPN],
 				      p, &info);
@@ -2568,12 +2569,11 @@ static void vpn_leak_to_vrf_update_onevrf(struct bgp *to_bgp,	/* to */
 	if (to_bgp->vpn_policy[afi].rmap[BGP_VPN_POLICY_DIR_FROMVPN]) {
 		struct bgp_path_info info;
 		route_map_result_t ret;
+		struct bgp_path_info_extra path_extra;
+		struct peer *fpeer = from ? from : to_bgp->peer_self;
 
-		memset(&info, 0, sizeof(info));
-		info.peer = from ? from : to_bgp->peer_self;
-		info.attr = &static_attr;
-		info.extra = path_vpn->extra; /* Used for source-vrf filter */
-		info.net = path_vpn->net;     /* Used to detect afi and safi */
+		prep_for_rmap_apply(&info, &path_extra, path_vpn->net, path_vpn, fpeer, NULL,
+				    &static_attr);
 		ret = route_map_apply(to_bgp->vpn_policy[afi]
 					      .rmap[BGP_VPN_POLICY_DIR_FROMVPN],
 				      p, &info);
@@ -2901,6 +2901,7 @@ void vpn_leak_to_vrf_update_all(struct bgp *to_bgp, struct bgp *vpn_from,
 		struct bgp_table *table;
 		struct bgp_dest *bn;
 		struct bgp_path_info *bpi;
+		struct peer *orig_peer;
 
 		/* This is the per-RD table of prefixes */
 		table = bgp_dest_get_bgp_table_info(pdest);
@@ -2912,12 +2913,18 @@ void vpn_leak_to_vrf_update_all(struct bgp *to_bgp, struct bgp *vpn_from,
 
 			for (bpi = bgp_dest_get_bgp_path_info(bn); bpi;
 			     bpi = bpi->next) {
-				if (bpi->extra && bpi->extra->vrfleak &&
-				    bpi->extra->vrfleak->bgp_orig == to_bgp)
-					continue;
+				orig_peer = bpi->peer;
+
+				if (bpi->extra && bpi->extra->vrfleak) {
+					if (bpi->extra->vrfleak->bgp_orig == to_bgp)
+						continue;
+
+					if (bpi->extra->vrfleak->peer_orig)
+						orig_peer = bpi->extra->vrfleak->peer_orig;
+				}
 
 				vpn_leak_to_vrf_update_onevrf(to_bgp, vpn_from, bpi, NULL,
-							      bpi->peer);
+							      orig_peer);
 			}
 		}
 	}
@@ -3359,7 +3366,7 @@ void vrf_unimport_from_vrf(struct bgp *to_bgp, struct bgp *from_bgp, const char 
 	 * import_vrf and export_vrf must match in having
 	 * the in/out names as appropriate.
 	 * export_vrf list could have been cleaned up
-	 * as part of no router bgp source instnace.
+	 * as part of no router bgp source instance.
 	 */
 	if (!vname)
 		return;
@@ -4107,7 +4114,7 @@ void vpn_leak_postchange_all(void)
 
 /* When a bgp vrf instance is unconfigured, remove its routes
  * from the VPN table and this vrf could be importing routes from other
- * bgp vrf instnaces, unimport them.
+ * bgp vrf instances, unimport them.
  * VRF X and VRF Y are exporting routes to each other.
  * When VRF X is deleted, unimport its routes from all target vrfs,
  * also VRF Y should unimport its routes from VRF X table.

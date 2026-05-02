@@ -43,16 +43,19 @@ Test Execution Order:
 4. test_evpn_local_vtep_ip              - Verify local VTEP source IP
 5. test_vni_state                       - Verify VNI state (L2 and L3)
 6. test_l3vni_rmacs                     - Verify L3VNI RMACs
-7. test_vrf_routes                      - Display VRF routes (informational)
-8. test_evpn_vtep_nexthops              - Verify L3VNI next-hops
-9. test_evpn_check_overlay_route        - Verify EVPN Type-5 overlay route in VRF RIB
-10. test_host_to_host_ping              - Verify end-to-end connectivity
-11. test_memory_leak                    - Memory leak detection
+7. test_l3vni_rmac_change               - Verify RMAC cleanup on router MAC change (commits 1-3)
+8. test_vrf_routes                      - Display VRF routes (informational)
+9. test_evpn_vtep_nexthops              - Verify L3VNI next-hops
+10. test_evpn_check_overlay_route       - Verify EVPN Type-5 overlay route in VRF RIB
+11. test_evpn_vtep_on_uplink_flap       - No stale VTEP when uplinks down; VTEPs back when up
+12. test_host_to_host_ping              - Verify end-to-end connectivity
+13. test_memory_leak                    - Memory leak detection
 """
 
 import os
 import sys
 import json
+import re
 from functools import partial
 import pytest
 
@@ -74,6 +77,8 @@ from lib.evpn import (
     evpn_verify_bgp_vni_state,
     evpn_verify_l3vni_remote_rmacs,
     evpn_verify_l3vni_remote_nexthops,
+    evpn_verify_l3vni_nexthops,
+    evpn_verify_no_remote_vtep_in_l3vni,
     evpn_verify_vrf_rib_route,
     evpn_verify_overlay_route_in_kernel,
     evpn_trigger_arp_scapy,
@@ -146,6 +151,9 @@ def tgen_and_ip_version(request):
     # Configure external router
     setup_ext1(tgen, ip_version)
 
+    # Configure ext-21 and leaf-21 VRF RED connectivity
+    setup_ext21_connectivity(tgen, ip_version)
+
     # Load FRR configuration for all routers from IP-version-specific directory
     router_list = tgen.routers()
 
@@ -159,6 +167,9 @@ def tgen_and_ip_version(request):
 
     # Start all routers
     tgen.start_router()
+
+    # Phase 2: Assign IPs on ext-21/leaf-21 after FRR has started
+    setup_ext21_post_start(tgen, ip_version)
 
     # Trigger ARP/NDP to populate MAC tables
     logger.info("Triggering ARP/NDP for MAC learning")
@@ -219,12 +230,12 @@ def tgen_and_ip_version(request):
 
 def build_topo(tgen):
     """
-    Build 3-tier CLOS topology with 16 nodes:
+    Build 3-tier CLOS topology with 17 nodes:
     - 2 spines (spine-1, spine-2)
     - 4 leafs (leaf-11, leaf-12, leaf-21, leaf-22)
     - 2 border ToRs (bordertor-11, bordertor-12) - EVPN VTEPs
     - 2 ToRs (tor-21, tor-22) - EVPN VTEPs
-    - 1 external router (ext-1)
+    - 2 external routers (ext-1, ext-21)
     - 5 hosts (host-111, host-121, host-211, host-221, host-1)
     """
 
@@ -240,6 +251,7 @@ def build_topo(tgen):
     tgen.add_router("tor-21")
     tgen.add_router("tor-22")
     tgen.add_router("ext-1")
+    tgen.add_router("ext-21")
     tgen.add_router("host-111")
     tgen.add_router("host-121")
     tgen.add_router("host-211")
@@ -370,6 +382,11 @@ def build_topo(tgen):
     switch = tgen.add_switch("s26")
     switch.add_link(tgen.gears["ext-1"], nodeif="swp6")
     switch.add_link(tgen.gears["host-1"], nodeif="swp4")
+
+    # Leaf-21 to ext-21 (one link)
+    switch = tgen.add_switch("s29")
+    switch.add_link(tgen.gears["leaf-21"], nodeif="swp5")
+    switch.add_link(tgen.gears["ext-21"], nodeif="swp1")
 
 
 def setup_vtep(tgen, rname, local_ip, is_bordertor=True):
@@ -673,6 +690,74 @@ def setup_ext1(tgen, ip_version):
             logger.info(f"Interface {intf} does not exist on ext-1, skipping")
 
 
+def setup_ext21_connectivity(tgen, ip_version):
+    """
+    Phase 1: Create VRF RED and bind interfaces on ext-21 and leaf-21.
+
+    VRF RED must be created in Linux before FRR loads the config, similar to
+    how vrf1/vrf2 are created in setup_vtep(). This phase only creates the VRF
+    and moves interfaces into it. IP assignment is deferred to phase 2
+    (setup_ext21_post_start) because tgen.start_router() resets interface IPs.
+
+    Only needed for IPv4 underlay (ext-21 config is IPv4-only).
+
+    Args:
+        tgen: Topogen instance
+        ip_version: IP version for underlay ("ipv4" or "ipv6")
+    """
+    if ip_version != "ipv4":
+        return
+
+    # --- ext-21: Create VRF RED and move swp1 into it ---
+    router = tgen.gears["ext-21"]
+    logger.info("Configuring ext-21 VRF RED (phase 1: VRF + interface binding)")
+
+    router.run("ip link del RED 2>/dev/null || true")
+    router.run("ip link add RED type vrf table 1003")
+    router.run("ip link set dev RED up")
+    router.run("ip link set dev swp1 master RED")
+    router.run("ip link set dev swp1 up")
+
+    # --- leaf-21: Create VRF RED and move swp5 into it ---
+    router = tgen.gears["leaf-21"]
+    logger.info("Configuring leaf-21 VRF RED (phase 1: VRF + interface binding)")
+
+    router.run("ip link del RED 2>/dev/null || true")
+    router.run("ip link add RED type vrf table 1003")
+    router.run("ip link set dev RED up")
+    router.run("ip link set dev swp5 master RED")
+    router.run("ip link set dev swp5 up")
+
+
+def setup_ext21_post_start(tgen, ip_version):
+    """
+    Phase 2: Assign IP addresses on ext-21 and leaf-21 after FRR has started.
+
+    Called after tgen.start_router() to ensure IPs are not stripped during
+    FRR daemon initialization.
+
+    Only needed for IPv4 underlay (ext-21 config is IPv4-only).
+
+    Args:
+        tgen: Topogen instance
+        ip_version: IP version for underlay ("ipv4" or "ipv6")
+    """
+    if ip_version != "ipv4":
+        return
+
+    # --- ext-21: Assign IP on swp1 ---
+    router = tgen.gears["ext-21"]
+    logger.info("Configuring ext-21 VRF RED (phase 2: IP assignment)")
+
+    router.run("ip addr replace 10.1.10.2/24 dev swp1")
+
+    # --- leaf-21: Assign IP on swp5 ---
+    router = tgen.gears["leaf-21"]
+    logger.info("Configuring leaf-21 VRF RED (phase 2: IP assignment)")
+
+    router.run("ip addr replace 10.1.10.3/24 dev swp5")
+
+
 def _check_route_in_vrf(router, vrf, route, ip_version):
     """Helper to check if route is present in VRF BGP table"""
     if ip_version == "ipv4":
@@ -845,8 +930,8 @@ def configure_route_leak_common(tor21, tor22, bordertor11, ip_version, route_con
          address-family l2vpn evpn
           neighbor 10.254.0.6 route-map FILTER-LEAF12 in
          exit-address-family
-        exit
-        """
+            exit
+            """
     )
 
 
@@ -1086,6 +1171,159 @@ def cleanup_export_vrf_test(bordertor11, ip_version):
             no ipv6 prefix-list EXPORT-ROUTES-v6
             """
         )
+
+
+def get_bestpath_as_length(router, ip_version, test_route):
+    """
+    Get the AS path length of the best path.
+    Returns (as_length, as_path_string) or (None, error_message) on failure.
+    """
+    if ip_version == "ipv4":
+        output = router.vtysh_cmd(
+            f"show bgp vrf vrf2 ipv4 unicast {test_route}", isjson=False
+        )
+    else:
+        output = router.vtysh_cmd(
+            f"show bgp vrf vrf2 ipv6 unicast {test_route}", isjson=False
+        )
+
+    # Find the path with "best (" marker, then look backwards to find its AS path
+    # For EVPN: AS path is on SAME line as "Imported from" after "VNI XXXXX"
+    # For VRF-leaked: AS path is on the NEXT line after "Imported from"
+    lines = output.split("\n")
+    for i, line in enumerate(lines):
+        if "best (" in line:  # Found best path marker
+            # Look backwards to find the "Imported from" line
+            for j in range(i, -1, -1):
+                if "Imported from" in lines[j]:
+                    imported_line = lines[j]
+                    # Check if AS path is on same line (EVPN case - after "VNI XXXXX")
+                    if "VNI" in imported_line:
+                        # Extract everything after "VNI XXXXX" pattern
+                        # Example: "...VNI 104002  651001 652000 651004..."
+                        parts = imported_line.split("VNI")
+                        if len(parts) > 1:
+                            after_vni = parts[1].strip()
+                            # Skip the VNI number, rest is AS path
+                            tokens = after_vni.split()
+                            if len(tokens) > 1:
+                                as_numbers = [x for x in tokens[1:] if x.isdigit()]
+                                as_path_str = " ".join(tokens[1:])
+                                return (len(as_numbers), as_path_str)
+                    else:
+                        # VRF-leaked case - AS path is on next line
+                        if j + 1 < len(lines):
+                            as_path_line = lines[j + 1].strip()
+                            as_numbers = [
+                                x for x in as_path_line.split() if x.isdigit()
+                            ]
+                            return (len(as_numbers), as_path_line)
+                    break
+    return (None, "Could not find best path AS path in output")
+
+
+def check_bestpath_uses_source_as(router, ip_version, test_route):
+    """
+    Verify best path is NOT the VRF-leaked path with stripped AS (local AS path length is 1).
+    WITHOUT 'use-imported-attributes': VRF-leaked path uses source/ultimate AS
+    which has AS path length > 1.
+    """
+    result = get_bestpath_as_length(router, ip_version, test_route)
+    if result[0] is None:
+        return result[1]  # Error message
+
+    as_length, as_path = result
+    if as_length > 1:
+        return None  # Success - best path has long AS (source AS used)
+    return f"Best path has short AS (len={as_length}), expected long. AS: {as_path}"
+
+
+def check_bestpath_uses_imported_as(router, ip_version, test_route):
+    """
+    Verify best path IS the VRF-leaked path with stripped AS (AS path length is 1).
+    WITH 'use-imported-attributes': VRF-leaked path uses imported/local AS
+    (which is stripped/short), so it wins because shorter AS wins.
+    Best path should have short AS path (== 1).
+    """
+    result = get_bestpath_as_length(router, ip_version, test_route)
+    if result[0] is None:
+        return result[1]  # Error message
+
+    as_length, as_path = result
+    if as_length == 1:
+        return None  # Success - best path has short AS (imported AS used)
+    return f"Best path has long AS (len={as_length}), expected 1. AS: {as_path}"
+
+
+def verify_bestpath_use_imported_attrs(bordertor11, ip_version, test_route):
+    """
+    Verify 'bgp bestpath use-imported-attributes' changes bestpath selection.
+
+    Shorter AS path always wins in BGP.
+
+    Without config: VRF-leaked path uses source attribute
+    With config:    VRF-leaked path uses local attribute
+    """
+    logger.info("Verifying 'bgp bestpath use-imported-attributes' behavior")
+
+    # Step 1: Without config - VRF-leaked path uses source AS (long), so doesn't win
+    test_func = partial(
+        check_bestpath_uses_source_as, bordertor11, ip_version, test_route
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=15, wait=1)
+    if result is not None:
+        pytest.fail(
+            f"Without config, expected best path with source AS (long): {result}"
+        )
+    logger.info("Verified: Best path uses source AS (long AS path)")
+
+    # Step 2: Enable 'bgp bestpath use-imported-attributes'
+    logger.info("Step 2: Enabling 'bgp bestpath use-imported-attributes'")
+    bordertor11.vtysh_multicmd(
+        """
+        configure terminal
+        router bgp 660000 vrf vrf2
+         bgp bestpath use-imported-attributes
+        exit
+        """
+    )
+
+    # Step 3: With config - VRF-leaked path uses imported AS (short/stripped), so it wins
+    logger.info(
+        "Step 3: Verifying best path uses imported AS (short) with 'use-imported-attributes'"
+    )
+    test_func = partial(
+        check_bestpath_uses_imported_as, bordertor11, ip_version, test_route
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    if result is not None:
+        # Log debug output
+        if ip_version == "ipv4":
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf2 ipv4 unicast {test_route}", isjson=False
+            )
+        else:
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf2 ipv6 unicast {test_route}", isjson=False
+            )
+        logger.error(f"BGP output:\n{output}")
+        pytest.fail(
+            f"With config, expected best path with imported AS (short): {result}"
+        )
+    logger.info("Verified: Best path uses imported AS (short/stripped AS path)")
+
+    # Step 4: Cleanup - remove the config
+    logger.info("Step 4: Removing 'bgp bestpath use-imported-attributes'")
+    bordertor11.vtysh_multicmd(
+        """
+        configure terminal
+        router bgp 660000 vrf vrf2
+         no bgp bestpath use-imported-attributes
+        exit
+        """
+    )
+
+    logger.info("'bgp bestpath use-imported-attributes' verification completed")
 
 
 def check_as_path_stripped(router, ip_version, test_route):
@@ -1670,6 +1908,165 @@ def test_l3vni_rmacs(tgen_and_ip_version):
     evpn_verify_l3vni_remote_rmacs(tgen, vtep_routers, l3vni_list)
 
 
+def test_l3vni_rmac_change(tgen_and_ip_version):
+    """
+    Test RMAC cleanup when router MAC changes on a remote VTEP.
+
+    This test validates fixes for RMAC management when a VTEP's router MAC
+    changes (e.g., due to system MAC change). The fixes ensure:
+    1. Old RMAC is properly uninstalled from remote VTEPs' RMAC cache
+    2. New RMAC is correctly installed
+    3. No duplicate RMACs exist for the same VTEP
+    4. RMAC nexthop list (nh_list) is properly managed
+
+    Expected behavior:
+    - WITHOUT FIX: Old RMAC remains in cache, causing duplicate RMACs for same VTEP
+    - WITH FIX: Old RMAC is properly cleaned up, only new RMAC exists
+    """
+    tgen, ip_version = tgen_and_ip_version
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    logger.info(f"Testing RMAC cleanup on router MAC change ({ip_version} underlay)")
+
+    tor21 = tgen.gears["tor-21"]
+    bordertor11 = tgen.gears["bordertor-11"]
+    l3vni = "104001"
+
+    # Get VTEP IP for tor-21 based on IP version
+    vtep_ips = VTEP_IPS[ip_version]
+    tor21_vtep_ip = vtep_ips["tor-21"]
+
+    def get_rmacs_for_vtep(router, vni, vtep_ip):
+        """Get ALL RMACs associated with a specific VTEP IP (to detect duplicates)"""
+        output = router.vtysh_cmd(f"show evpn rmac vni {vni} json", isjson=True)
+        rmacs = []
+        if output:
+            for key, value in output.items():
+                if isinstance(value, dict) and value.get("vtepIp") == vtep_ip:
+                    rmacs.append(key)
+        return rmacs
+
+    # Step 1: Capture initial RMAC state
+    logger.info("Step 1: Capturing initial RMAC state")
+
+    initial_rmacs = get_rmacs_for_vtep(bordertor11, l3vni, tor21_vtep_ip)
+    assert (
+        len(initial_rmacs) > 0
+    ), f"No RMAC found for tor-21 VTEP {tor21_vtep_ip} on bordertor-11"
+    initial_rmac = initial_rmacs[0]
+    logger.info(f"Initial RMAC for tor-21 ({tor21_vtep_ip}): {initial_rmac}")
+
+    # Get original MAC of vlan4001 on tor-21 for restoration
+    original_mac_output = tor21.run("ip link show vlan4001 | grep ether")
+    original_mac = (
+        original_mac_output.strip().split()[1] if original_mac_output else None
+    )
+
+    # Step 2: Change the MAC address (trigger RMAC change)
+    logger.info("Step 2: Changing router MAC on tor-21")
+
+    new_mac = initial_rmac[:-2] + "99"
+
+    if new_mac == initial_rmac:
+        new_mac = initial_rmac[:-2] + "98"
+
+    logger.info(f"Changing vlan4001 MAC from {original_mac} to {new_mac}")
+
+    tor21.run(f"ip link set dev vlan4001 down")
+    tor21.run(f"ip link set dev vlan4001 address {new_mac}")
+    tor21.run(f"ip link set dev vlan4001 up")
+
+    # Step 3: Verify RMAC update and check for duplicates
+    logger.info("Step 3: Verifying RMAC update (checking for duplicates)")
+
+    def check_rmac_updated_no_duplicates(router, vni, vtep_ip, old_rmac):
+        """
+        Check that:
+        1. New RMAC exists for the VTEP
+        2. Old RMAC is REMOVED (not duplicate)
+        3. Only ONE RMAC exists for this VTEP
+
+        WITHOUT FIX: This will FAIL because old RMAC remains (duplicate)
+        WITH FIX: This will PASS because old RMAC is cleaned up
+        """
+        output = router.vtysh_cmd(f"show evpn rmac vni {vni} json", isjson=True)
+        if not output:
+            return "No RMAC output"
+
+        # Find all RMACs for this VTEP
+        rmacs_for_vtep = []
+        for key, value in output.items():
+            if isinstance(value, dict) and value.get("vtepIp") == vtep_ip:
+                rmacs_for_vtep.append(key)
+
+        logger.info(
+            f"VTEP {vtep_ip}: found {len(rmacs_for_vtep)} RMAC(s): {rmacs_for_vtep}"
+        )
+
+        # Check for duplicates - THIS IS THE KEY TEST
+        if len(rmacs_for_vtep) > 1:
+            logger.error(
+                f"DUPLICATE RMACS DETECTED! Old RMAC {old_rmac} not cleaned up"
+            )
+            return (
+                f"DUPLICATE RMACs for VTEP {vtep_ip}: {rmacs_for_vtep}. "
+                f"Old RMAC {old_rmac} was not cleaned up!"
+            )
+
+        if len(rmacs_for_vtep) == 0:
+            return f"No RMAC found for VTEP {vtep_ip} (waiting for new RMAC)"
+
+        # Verify the old RMAC is gone
+        if rmacs_for_vtep[0] == old_rmac:
+            return f"Old RMAC {old_rmac} still present, waiting for new RMAC"
+
+        logger.info(f"SUCCESS: RMAC updated from {old_rmac} to {rmacs_for_vtep[0]}")
+        return None
+
+    test_func = partial(
+        check_rmac_updated_no_duplicates,
+        bordertor11,
+        l3vni,
+        tor21_vtep_ip,
+        initial_rmac,
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    # Step 4: Restore original MAC
+    logger.info("Step 4: Restoring original MAC on tor-21")
+
+    if original_mac:
+        tor21.run(f"ip link set dev vlan4001 down")
+        tor21.run(f"ip link set dev vlan4001 address {original_mac}")
+        tor21.run(f"ip link set dev vlan4001 up")
+
+    def check_rmac_restored(router, vni, vtep_ip):
+        """Check that RMAC exists for the VTEP after restoration"""
+        output = router.vtysh_cmd(f"show evpn rmac vni {vni} json", isjson=True)
+        if not output:
+            return "No RMAC output"
+
+        for key, value in output.items():
+            if isinstance(value, dict) and value.get("vtepIp") == vtep_ip:
+                logger.info(f"RMAC restored: {key} for VTEP {vtep_ip}")
+                return None
+
+        return f"No RMAC found for VTEP {vtep_ip} after restoration"
+
+    test_func = partial(check_rmac_restored, bordertor11, l3vni, tor21_vtep_ip)
+    _, restore_result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+
+    # Final assertions
+    assert result is None, (
+        f"RMAC change verification failed: {result}\n"
+        f"This indicates duplicate RMACs exist - the fix is not working!"
+    )
+    assert restore_result is None, f"RMAC restoration check failed: {restore_result}"
+
+    logger.info("RMAC cleanup test completed successfully")
+
+
 def test_vrf_routes(tgen_and_ip_version):
     """
     Verify routes in VRF1 and VRF2
@@ -1831,6 +2228,81 @@ def test_evpn_check_overlay_route(tgen_and_ip_version):
     )
 
 
+def test_evpn_vtep_on_uplink_flap(tgen_and_ip_version):
+    """
+    Verify EVPN remote VTEP lifecycle across uplink flap.
+
+    1. Pre-check: remote VTEPs are present before any disruption.
+    2. Bring swp1 and swp2 (uplinks to leaf layer) down and verify all remote
+       VTEP next-hops are removed (no stale entries).
+    3. Bring swp1 and swp2 back up and verify remote VTEPs are learned again.
+    """
+    tgen, ip_version = tgen_and_ip_version
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    router = tgen.gears["tor-21"]
+    l3vni_list = ["104001", "104002"]
+    expected_remote_vteps = [
+        VTEP_IPS[ip_version]["bordertor-11"],
+        VTEP_IPS[ip_version]["bordertor-12"],
+        VTEP_IPS[ip_version]["tor-22"],
+    ]
+
+    logger.info(
+        "tor-21: verifying remote VTEPs present before uplink flap ({})".format(
+            ip_version
+        )
+    )
+    test_func = partial(
+        evpn_verify_l3vni_nexthops,
+        router,
+        l3vni_list,
+        expected_remote_vteps,
+    )
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, (
+        "tor-21: remote VTEPs not present before uplink flap: {}".format(result)
+    )
+
+    try:
+        logger.info(
+            "tor-21: bringing uplinks swp1 and swp2 down ({})".format(ip_version)
+        )
+        router.run("ip link set dev swp1 down")
+        router.run("ip link set dev swp2 down")
+
+        test_func = partial(
+            evpn_verify_no_remote_vtep_in_l3vni,
+            router,
+            l3vni_list,
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, (
+            "tor-21: stale VTEP entries after uplink down: {}".format(result)
+        )
+        logger.info("tor-21: no stale VTEP entries after uplinks down")
+
+        logger.info("tor-21: bringing uplinks swp1 and swp2 up")
+        router.run("ip link set dev swp1 up")
+        router.run("ip link set dev swp2 up")
+
+        test_func = partial(
+            evpn_verify_l3vni_nexthops,
+            router,
+            l3vni_list,
+            expected_remote_vteps,
+        )
+        _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+        assert result is None, (
+            "tor-21: remote VTEPs not restored after uplink up: {}".format(result)
+        )
+        logger.info("tor-21: remote VTEPs restored after uplinks up")
+    finally:
+        router.run("ip link set dev swp1 up 2>/dev/null || true")
+        router.run("ip link set dev swp2 up 2>/dev/null || true")
+
+
 def test_host_to_host_ping(tgen_and_ip_version):
     """
     Test ping connectivity between hosts across EVPN fabric
@@ -1875,7 +2347,7 @@ def test_host_to_host_ping(tgen_and_ip_version):
             source_ip="192.168.11.211",
             count=4,
         )
-        _, result = topotest.run_and_expect(test_func, None, count=10, wait=1)
+        _, result = topotest.run_and_expect(test_func, None, count=15, wait=1)
         assert result is None, f"IPv4 connectivity test failed: {result}"
     else:
         logger.info("Skipping IPv4 connectivity test (not running with IPv4 underlay)")
@@ -1907,10 +2379,13 @@ def test_for_leaked_route_as_path(tgen_and_ip_version):
 
     Tests BOTH code paths:
     1. 'import vrf route-map' on VRF2 (destination), importing from VRF1 (source)
+       - Also verifies 'bgp bestpath use-imported-attributes':
+         * Without config: path #1 (longer AS path, ultimate attrs) is best
+         * With config: path #2 (stripped AS path, imported attrs) becomes best
     2. 'route-map vpn export' on VRF1 (source), exporting to VRF2 (destination)
 
     Both tests use the same common setup, but with different route-map locations.
-    Route is originated from tor-21 and and DUT is bordertor-11
+    Route is originated from tor-21 and DUT is bordertor-11
     """
     tgen, ip_version = tgen_and_ip_version
     if tgen.routers_have_failure():
@@ -1934,9 +2409,19 @@ def test_for_leaked_route_as_path(tgen_and_ip_version):
         configure_route_leak_common(tor21, tor22, bordertor11, ip_version, route_config)
 
         # TEST 1: 'import vrf route-map' on VRF2 (destination), importing from VRF1 (source)
+        # Also verifies 'bgp bestpath use-imported-attributes' behavior in vrf2
         try:
             configure_import_vrf_test(bordertor11, ip_version)
             verify_as_path_stripping(bordertor11, ip_version, test_route)
+
+            # Verify bestpath selection with and without 'bgp bestpath use-imported-attributes'
+            # Without config: Leaked path(from vrf1) in vrf2, uses source path's attribute/AS path length
+            # which is longer than directly imported (from EVPN) paths' AS path length. So directly imported path
+            # wins bestpath selection in vrf2
+            # With config: Leaked path(from vrf1) in vrf2, uses local/imported path's attribute/AS path length
+            # which is shorter than directly imported (from EVPN) path's AS path length. So leaked path wins bestpath
+            # selection in vrf2
+            verify_bestpath_use_imported_attrs(bordertor11, ip_version, test_route)
         finally:
             cleanup_import_vrf_test(bordertor11, ip_version)
 
@@ -1953,6 +2438,348 @@ def test_for_leaked_route_as_path(tgen_and_ip_version):
             cleanup_route_leak_common(tor21, tor22, bordertor11, ip_version, test_route)
         except Exception as e:
             logger.error(f"Common cleanup failed: {e}")
+
+
+def test_as_path_strip_survives_config_change(tgen_and_ip_version):
+    """
+    Test that AS path stripping works correctly when routes are re-imported
+    via vpn_leak_to_vrf_update_all().
+
+    This specifically tests the fix in vpn_leak_to_vrf_update_all() where
+    we pass peer_orig instead of bpi->peer to preserve the original EBGP
+    peer information for route-map processing.
+
+    Bug without fix:
+    - vpn_leak_to_vrf_update_all() passes bpi->peer (peer_self, sort=0)
+    - route_set_aspath_exclude() skips stripping when peer->sort == UNSPECIFIED
+    - AS path is NOT stripped on re-import
+
+    Test scenario:
+    1. ext-1 (CE router, AS 655000) advertises route with AS prepending to
+       bordertor-11's vrf1 via direct EBGP peering
+    2. bordertor-11 leaks route from vrf1 to vrf2 with 'set as-path exclude'
+    3. Verify AS path is stripped (initial leak via vpn_leak_from_vrf_update)
+    4. Remove and re-add 'import vrf vrf1' to trigger vpn_leak_to_vrf_update_all()
+    5. Verify AS path is STILL stripped (tests our fix!)
+    """
+    tgen, ip_version = tgen_and_ip_version
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    logger.info(
+        f"Testing AS path stripping survives config change ({ip_version} underlay)"
+    )
+
+    # Only run for IPv4 - ext-1 route advertisement is simpler
+    if ip_version != "ipv4":
+        pytest.skip("This test only runs with IPv4 underlay")
+
+    ext1 = tgen.gears["ext-1"]
+    bordertor11 = tgen.gears["bordertor-11"]
+
+    # Use a UNIQUE route that ONLY ext-1 has (not available via EVPN from other VTEPs)
+    # This ensures the ext-1 path is the BEST path in vrf1
+    test_route = "203.0.119.0/24"
+
+    # AS numbers used in test:
+    # - Prepend: 655001 655000 655002
+    # - Strip: 655000 (the middle one)
+    # - Keep: 655001 and 655002 (both ends should remain after stripping)
+    as_to_strip = "655000"
+    as_prepend = "655001 655000 655002"
+
+    try:
+        # Step 1: Create static route on ext-1 and advertise with AS prepending
+        # Prepend 655001 655000 655002 (will strip 655000 from middle)
+        # ONLY to bordertor-11 vrf1 (192.0.2.2)
+        # BLOCK to: bordertor-11 vrf2 (192.0.2.6), bordertor-12 vrf1 (192.0.2.10), bordertor-12 vrf2 (192.0.2.14)
+        logger.info(
+            "Step 1: Create unique static route on ext-1, advertise ONLY to bordertor-11 vrf1"
+        )
+        logger.info(f"        Prepending AS: {as_prepend}")
+        logger.info(f"        Will strip: {as_to_strip} (middle AS)")
+        ext1.vtysh_multicmd(
+            f"""
+            configure terminal
+            ip route 203.0.119.0/24 Null0
+            !
+            ip prefix-list TEST-PREPEND seq 10 permit 203.0.119.0/24
+            !
+            route-map PREPEND-TO-BORDERTOR permit 10
+             match ip address prefix-list TEST-PREPEND
+             set as-path prepend {as_prepend}
+            exit
+            route-map PREPEND-TO-BORDERTOR permit 20
+            exit
+            !
+            route-map BLOCK-TEST-ROUTE deny 10
+             match ip address prefix-list TEST-PREPEND
+            exit
+            route-map BLOCK-TEST-ROUTE permit 20
+            exit
+            !
+            router bgp 655000
+             address-family ipv4 unicast
+              redistribute static route-map PREPEND-TO-BORDERTOR
+              neighbor 192.0.2.2 route-map PREPEND-TO-BORDERTOR out
+              neighbor 192.0.2.6 route-map BLOCK-TEST-ROUTE out
+              neighbor 192.0.2.10 route-map BLOCK-TEST-ROUTE out
+              neighbor 192.0.2.14 route-map BLOCK-TEST-ROUTE out
+             exit-address-family
+            exit
+            """
+        )
+
+        # Step 2: Configure route leak with AS path exclude on bordertor-11
+        # Strip 655000 (middle), keep 655001 and 655002
+        logger.info(
+            f"Step 2: Configure route leak vrf1->vrf2 with 'set as-path exclude {as_to_strip}'"
+        )
+        bordertor11.vtysh_multicmd(
+            f"""
+            configure terminal
+            ip prefix-list EXT1-ROUTES seq 10 permit 203.0.119.0/24
+            !
+            route-map LEAK-STRIP-AS permit 10
+             match ip address prefix-list EXT1-ROUTES
+             set as-path exclude {as_to_strip}
+            exit
+            route-map LEAK-STRIP-AS permit 20
+            exit
+            !f
+            router bgp 660000 vrf vrf2
+             address-family ipv4 unicast
+              import vrf route-map LEAK-STRIP-AS
+              import vrf vrf1
+             exit-address-family
+            exit
+            """
+        )
+
+        # Step 3: Wait for route to arrive in vrf1 first (source VRF)
+        logger.info(
+            "Step 3a: Wait for route to arrive in source VRF (vrf1) with prepended AS path"
+        )
+        logger.info(
+            f"        Expected AS path in vrf1: {as_prepend} 655000 (prepend + ext-1's AS)"
+        )
+
+        def check_route_in_vrf1():
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf1 ipv4 unicast {test_route}", isjson=False
+            )
+            if "Network not in table" in output:
+                return f"Route {test_route} not found in vrf1 yet"
+            # Verify AS prepending - should see 655001 and 655002
+            if "655001" not in output:
+                return "AS 655001 not visible yet"
+            if "655002" not in output:
+                return "AS 655002 not visible yet"
+            # Verify this is from ext-1
+            if "ext-1" not in output and "192.0.2.1" not in output:
+                return "Route not from ext-1"
+            return None
+
+        _, result = topotest.run_and_expect(check_route_in_vrf1, None, count=30, wait=1)
+        if result is not None:
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf1 ipv4 unicast {test_route}", isjson=False
+            )
+            logger.error(f"Source VRF (vrf1) route state:\n{output}")
+            pytest.fail(f"Route not arriving in source VRF with prepended AS: {result}")
+
+        # Log the source VRF route to prove AS prepending is working
+        output_vrf1 = bordertor11.vtysh_cmd(
+            f"show bgp vrf vrf1 ipv4 unicast {test_route}", isjson=False
+        )
+
+        # Verify this is the ONLY path (no EVPN paths)
+        if "Paths: (1 available" not in output_vrf1:
+            logger.info(
+                f"=== SOURCE VRF (vrf1) route - ONLY from ext-1 with prepended AS ===\n{output_vrf1}"
+            )
+            logger.warning(
+                "WARNING: Multiple paths exist - ext-1 path may not be best!"
+            )
+            logger.warning("Test may not accurately validate the bug fix.")
+
+        # Step 3b: Verify initial AS path stripping works in destination VRF
+        # Check ONLY the leaked paths from vrf1, not EVPN paths which bypass route-map
+        logger.info(
+            "Step 3b: Verify initial AS path stripping in destination VRF (vrf2)"
+        )
+
+        def check_vrf1_leaked_path_stripped(output):
+            """
+            Check if leaked paths from vrf1 have AS path correctly processed:
+            - AS 655001 and 655002 should be PRESENT (proves route arrived)
+            - AS 655000 should be ABSENT (proves stripping worked)
+
+            Output format for leaked path:
+              Imported from 192.0.2.2:2:203.0.119.0/24
+              655001 655002                          <-- AS path (655000 stripped from middle)
+                10.0.0.2(bordertor-11) from 0.0.0.0 (192.0.2.6) vrf vrf1(8)
+
+            Returns None if correct, error message otherwise.
+            """
+            if "Network not in table" in output:
+                return "Route not found in vrf2 yet"
+            if "vrf vrf1" not in output:
+                return "Leaked path from vrf1 not present yet"
+
+            # Find all leaked paths from vrf1 and check their AS paths
+            lines = output.split("\n")
+            found_vrf1_path = False
+            for i, line in enumerate(lines):
+                if "vrf vrf1" in line:
+                    found_vrf1_path = True
+                    # Look backwards for AS path line (between "Imported from" and current line)
+                    for j in range(i - 1, max(0, i - 5), -1):
+                        prev_line = lines[j].strip()
+                        # Skip empty lines and the next-hop line
+                        if (
+                            not prev_line
+                            or prev_line.startswith("10.0.0")
+                            or prev_line.startswith("192.0.2")
+                        ):
+                            continue
+                        # Check if this is the AS path line
+                        if prev_line.startswith("Imported from"):
+                            break  # Reached the "Imported from" line, no AS path found (Local?)
+                        # This should be the AS path line - check conditions
+                        if "655001" not in prev_line:
+                            return f"Leaked path missing AS 655001 - route not fully processed yet: {prev_line}"
+                        if "655002" not in prev_line:
+                            return f"Leaked path missing AS 655002 - route not fully processed yet: {prev_line}"
+                        if as_to_strip in prev_line:
+                            return f"Leaked path still has AS {as_to_strip} (NOT stripped): {prev_line}"
+                        # All conditions met - 655001 and 655002 present, 655000 absent
+                        break
+
+            if not found_vrf1_path:
+                return "No leaked path from vrf1 found"
+            return None
+
+        def check_initial_strip():
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf2 ipv4 unicast {test_route}", isjson=False
+            )
+            return check_vrf1_leaked_path_stripped(output)
+
+        _, result = topotest.run_and_expect(check_initial_strip, None, count=30, wait=1)
+        if result is not None:
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf2 ipv4 unicast {test_route}", isjson=False
+            )
+            logger.error(f"Destination VRF (vrf2) route state:\n{output}")
+            pytest.fail(f"Initial AS path stripping failed: {result}")
+
+        output_vrf2 = bordertor11.vtysh_cmd(
+            f"show bgp vrf vrf2 ipv4 unicast {test_route}", isjson=False
+        )
+
+        # Step 4: Trigger removing and re-adding import vrf
+        logger.info("Step 4: Remove and re-add 'import vrf vrf1'")
+
+        # First remove import vrf
+        bordertor11.vtysh_multicmd(
+            """
+            configure terminal
+            router bgp 660000 vrf vrf2
+             address-family ipv4 unicast
+              no import vrf vrf1
+             exit-address-family
+            exit
+            """
+        )
+
+        # Wait for routes to be withdrawn
+        def check_route_withdrawn():
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf2 ipv4 unicast {test_route}", isjson=False
+            )
+            # Check that the leaked path from vrf1 is gone
+            if "vrf vrf1" in output.lower():
+                return "Leaked route from vrf1 still present"
+            return None
+
+        _, result = topotest.run_and_expect(
+            check_route_withdrawn, None, count=30, wait=1
+        )
+        logger.info("Import vrf removed, leaked routes withdrawn")
+
+        # Now re-add import vrf
+        bordertor11.vtysh_multicmd(
+            """
+            configure terminal
+            router bgp 660000 vrf vrf2
+             address-family ipv4 unicast
+              import vrf vrf1
+             exit-address-family
+            exit
+            """
+        )
+
+        # Step 5: Verify AS path is STILL stripped after re-import
+        logger.info("Step 5: Verify AS path STILL stripped after re-import")
+
+        def check_after_config_change():
+            output = bordertor11.vtysh_cmd(
+                f"show bgp vrf vrf2 ipv4 unicast {test_route}", isjson=False
+            )
+            return check_vrf1_leaked_path_stripped(output)
+
+        _, result = topotest.run_and_expect(
+            check_after_config_change, None, count=20, wait=1
+        )
+
+        if result is not None:
+            logger.error(f"Re-import test FAILED!, AS path didn't get stripped")
+            pytest.fail(f"Re-import test failed: {result}")
+
+        logger.info("Test PASSED: AS path stripping works correctly")
+
+    finally:
+        # Cleanup
+        logger.info("Cleaning up test configuration")
+        try:
+            bordertor11.vtysh_multicmd(
+                """
+                configure terminal
+                router bgp 660000 vrf vrf2
+                 address-family ipv4 unicast
+                  no import vrf vrf1
+                  no import vrf route-map LEAK-STRIP-AS
+                 exit-address-family
+                exit
+                no route-map LEAK-STRIP-AS
+                no ip prefix-list EXT1-ROUTES
+                """
+            )
+        except Exception as e:
+            logger.warning(f"bordertor-11 cleanup error: {e}")
+
+        try:
+            ext1.vtysh_multicmd(
+                """
+                configure terminal
+                router bgp 655000
+                 address-family ipv4 unicast
+                  no redistribute static route-map PREPEND-TO-BORDERTOR
+                  no neighbor 192.0.2.2 route-map PREPEND-TO-BORDERTOR out
+                  no neighbor 192.0.2.6 route-map BLOCK-TEST-ROUTE out
+                  no neighbor 192.0.2.10 route-map BLOCK-TEST-ROUTE out
+                  no neighbor 192.0.2.14 route-map BLOCK-TEST-ROUTE out
+                 exit-address-family
+                exit
+                no route-map PREPEND-TO-BORDERTOR
+                no route-map BLOCK-TEST-ROUTE
+                no ip prefix-list TEST-PREPEND
+                no ip route 203.0.119.0/24 Null0
+                """
+            )
+        except Exception as e:
+            logger.warning(f"ext-1 cleanup error: {e}")
 
 
 def test_l3vni_l2vni_transition_restore(tgen_and_ip_version):
@@ -2170,6 +2997,307 @@ def test_l3vni_l2vni_transition_restore(tgen_and_ip_version):
     assert (
         result is None
     ), f"BGP L3VNI state validation failed for VNI {l3vni} after restore: {result}"
+
+
+def test_ext21_dynamic_neighbor(tgen_and_ip_version):
+    """
+    Verify ext-21 dynamic BGP neighbor is established with leaf-21 in VRF RED.
+
+    ext-21 uses 'bgp listen range 10.1.10.0/24 peer-group test' (dynamic neighbor)
+    in VRF RED (AS 651006). leaf-21 has an explicit neighbor 10.1.10.2 configured
+    in 'router bgp 651004 vrf RED'.
+
+    This test validates:
+    1. On ext-21 (VRF RED): The dynamic neighbor 10.1.10.3 (leaf-21) is discovered
+       via the listen range and reaches Established state.
+    2. On leaf-21 (VRF RED): The explicit neighbor 10.1.10.2 (ext-21) reaches
+       Established state.
+    3. Both sides see each other's correct remote AS.
+
+    Only runs for IPv4 underlay since ext-21 config is IPv4-only.
+    """
+    tgen, ip_version = tgen_and_ip_version
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    # ext-21 config only exists for IPv4 underlay
+    if ip_version != "ipv4":
+        pytest.skip("ext-21 is only configured for IPv4 underlay")
+
+    logger.info("Verifying ext-21 dynamic BGP neighbor with leaf-21 in VRF RED")
+
+    ext21 = tgen.gears["ext-21"]
+    leaf21 = tgen.gears["leaf-21"]
+
+    # --- Check ext-21 side: dynamic neighbor 10.1.10.3 (leaf-21) in VRF RED ---
+    def check_ext21_dynamic_neighbor():
+        output = ext21.vtysh_cmd("show bgp vrf RED summary json", isjson=True)
+        if not output:
+            return "ext-21: No BGP VRF RED summary output"
+
+        # Look for ipv4Unicast peers in VRF RED
+        if "ipv4Unicast" not in output:
+            return "ext-21: No ipv4Unicast address family in VRF RED"
+
+        af_data = output["ipv4Unicast"]
+        if "peers" not in af_data or not af_data["peers"]:
+            return "ext-21: No peers found in VRF RED ipv4Unicast"
+
+        # The dynamic neighbor should be 10.1.10.3 (leaf-21's swp5 in VRF RED)
+        peer_ip = "10.1.10.3"
+        if peer_ip not in af_data["peers"]:
+            return (
+                f"ext-21: Dynamic neighbor {peer_ip} not discovered via listen range. "
+                f"Active peers: {list(af_data['peers'].keys())}"
+            )
+
+        peer_data = af_data["peers"][peer_ip]
+        state = peer_data.get("state", "")
+        if state != "Established":
+            return (
+                f"ext-21: Dynamic neighbor {peer_ip} not Established (state: {state})"
+            )
+
+        # Verify the remote AS is correct (leaf-21 AS 651004)
+        remote_as = peer_data.get("remoteAs")
+        if remote_as != 651004:
+            return (
+                f"ext-21: Dynamic neighbor {peer_ip} has unexpected remote AS "
+                f"{remote_as}, expected 651004"
+            )
+
+        logger.info(
+            f"ext-21: Dynamic neighbor {peer_ip} is Established "
+            f"(remote AS {remote_as}, peer-group test)"
+        )
+        return None
+
+    test_func = partial(check_ext21_dynamic_neighbor)
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, f"ext-21 dynamic neighbor verification failed: {result}"
+
+    # --- Check leaf-21 side: explicit neighbor 10.1.10.2 (ext-21) in VRF RED ---
+    def check_leaf21_vrf_red_neighbor():
+        output = leaf21.vtysh_cmd("show bgp vrf RED summary json", isjson=True)
+        if not output:
+            return "leaf-21: No BGP VRF RED summary output"
+
+        if "ipv4Unicast" not in output:
+            return "leaf-21: No ipv4Unicast address family in VRF RED"
+
+        af_data = output["ipv4Unicast"]
+        if "peers" not in af_data or not af_data["peers"]:
+            return "leaf-21: No peers found in VRF RED ipv4Unicast"
+
+        peer_ip = "10.1.10.2"
+        if peer_ip not in af_data["peers"]:
+            return (
+                f"leaf-21: Neighbor {peer_ip} not found in VRF RED. "
+                f"Active peers: {list(af_data['peers'].keys())}"
+            )
+
+        peer_data = af_data["peers"][peer_ip]
+        state = peer_data.get("state", "")
+        if state != "Established":
+            return f"leaf-21: Neighbor {peer_ip} not Established (state: {state})"
+
+        # Verify the remote AS is correct (ext-21 AS 651006)
+        remote_as = peer_data.get("remoteAs")
+        if remote_as != 651006:
+            return (
+                f"leaf-21: Neighbor {peer_ip} has unexpected remote AS "
+                f"{remote_as}, expected 651006"
+            )
+
+        logger.info(
+            f"leaf-21: Neighbor {peer_ip} is Established " f"(remote AS {remote_as})"
+        )
+        return None
+
+    test_func = partial(check_leaf21_vrf_red_neighbor)
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert result is None, f"leaf-21 VRF RED neighbor verification failed: {result}"
+
+    logger.info(
+        "ext-21 dynamic neighbor verification completed successfully: "
+        "ext-21 (10.1.10.2, AS 651006) <-> leaf-21 (10.1.10.3, AS 651004) "
+        "in VRF RED is Established"
+    )
+
+
+def test_ext21_dynamic_neighbor_password(tgen_and_ip_version):
+    """
+    Verify that adding and removing a password on ext-21's peer-group
+    correctly tears down and re-establishes the dynamic BGP neighbor
+    with leaf-21 in VRF RED.
+
+    This validates the fix for the stale per-peer TCP MD5 entry bug:
+    when a password is set on a peer-group with a dynamic neighbor listen
+    range, a /32 MD5 entry is installed on the listen socket for each
+    existing dynamic member.  When the password is later removed, the
+    prefix-range /24 entry is cleared but the per-peer /32 entry was
+    previously left behind, causing the kernel to silently drop the
+    reconnecting peer's SYN.
+
+    Sequence:
+      1. Verify ext-21 dynamic neighbor (10.1.10.3) is Established.
+      2. Apply 'neighbor test password test4' on ext-21 VRF RED.
+      3. Confirm the session is torn down:
+         - ext-21: dynamic neighbor deleted (summary returns empty JSON {})
+         - leaf-21: static neighbor 10.1.10.2 is NOT Established (e.g. Connect)
+      4. Remove the password with 'no neighbor test password'.
+      5. Confirm the dynamic neighbor re-establishes to Established state.
+
+    Only runs for IPv4 underlay since ext-21 config is IPv4-only.
+    """
+    tgen, ip_version = tgen_and_ip_version
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    if ip_version != "ipv4":
+        pytest.skip("ext-21 is only configured for IPv4 underlay")
+
+    ext21 = tgen.gears["ext-21"]
+    leaf21 = tgen.gears["leaf-21"]
+
+    # ---- Helper: check ext-21 dynamic neighbor is Established ----
+    def check_ext21_established():
+        output = ext21.vtysh_cmd("show bgp vrf RED summary json", isjson=True)
+        if not output:
+            return "ext-21: VRF RED summary is empty (no dynamic peers yet)"
+
+        if "ipv4Unicast" not in output:
+            return "ext-21: No ipv4Unicast in VRF RED summary (no dynamic peers yet)"
+
+        af_data = output["ipv4Unicast"]
+        if "peers" not in af_data or not af_data["peers"]:
+            return "ext-21: No peers found in VRF RED ipv4Unicast"
+
+        peer_ip = "10.1.10.3"
+        if peer_ip not in af_data["peers"]:
+            return (
+                f"ext-21: Dynamic neighbor {peer_ip} not found. "
+                f"Active peers: {list(af_data['peers'].keys())}"
+            )
+
+        peer_data = af_data["peers"][peer_ip]
+        state = peer_data.get("state", "")
+        if state != "Established":
+            return (
+                f"ext-21: Dynamic neighbor {peer_ip} state is {state}, "
+                f"expected Established"
+            )
+        return None
+
+    # ---- Helper: verify session is torn down after password set ----
+    # Two-sided check:
+    #   ext-21 (dynamic side): returns {} when the dynamic peer is deleted,
+    #     since there are no configured peers -- only listen ranges.
+    #   leaf-21 (static side): the configured neighbor 10.1.10.2 stays in
+    #     the summary but transitions to a non-Established state (e.g.
+    #     Connect, Active).  This proves the session was genuinely disrupted
+    #     and that leaf-21's BGP process is still healthy.
+    def check_session_torn_down():
+        # -- ext-21: dynamic peer must be gone --
+        ext_output = ext21.vtysh_cmd("show bgp vrf RED summary json", isjson=True)
+        # When all dynamic peers are deleted, FRR returns {} for the VRF
+        # summary.  If ipv4Unicast is present, the dynamic peer might
+        # still be lingering.
+        if ext_output and "ipv4Unicast" in ext_output:
+            af_data = ext_output["ipv4Unicast"]
+            peers = af_data.get("peers", {})
+            peer_ip = "10.1.10.3"
+            if peer_ip in peers:
+                state = peers[peer_ip].get("state", "unknown")
+                return (
+                    f"ext-21: Dynamic neighbor {peer_ip} still present "
+                    f"(state: {state}), waiting for deletion"
+                )
+
+        # -- leaf-21: static neighbor must NOT be Established --
+        leaf_output = leaf21.vtysh_cmd("show bgp vrf RED summary json", isjson=True)
+        if not leaf_output:
+            return "leaf-21: No BGP VRF RED summary output"
+
+        if "ipv4Unicast" not in leaf_output:
+            return "leaf-21: ipv4Unicast missing from VRF RED summary"
+
+        af_data = leaf_output["ipv4Unicast"]
+        peers = af_data.get("peers", {})
+        peer_ip = "10.1.10.2"
+
+        if peer_ip not in peers:
+            return (
+                f"leaf-21: Static neighbor {peer_ip} missing from VRF RED "
+                f"(expected present in non-Established state)"
+            )
+
+        state = peers[peer_ip].get("state", "")
+        if state == "Established":
+            return (
+                f"leaf-21: Neighbor {peer_ip} is still Established "
+                f"after password was set on ext-21 peer-group"
+            )
+
+        logger.info(
+            f"Session torn down confirmed: ext-21 dynamic peer gone, "
+            f"leaf-21 neighbor {peer_ip} state is {state}"
+        )
+        return None
+
+    # Step 1: Confirm the session is Established before we begin
+    logger.info("Step 1: Verify ext-21 dynamic neighbor is Established")
+    test_func = partial(check_ext21_established)
+    _, result = topotest.run_and_expect(test_func, None, count=60, wait=1)
+    assert (
+        result is None
+    ), f"Pre-condition failed - ext-21 dynamic neighbor not Established: {result}"
+
+    # Step 2: Apply password on peer-group
+    logger.info("Step 2: Applying 'neighbor test password test4' on ext-21 VRF RED")
+    ext21.vtysh_cmd(
+        """
+        configure terminal
+        router bgp 651006 vrf RED
+        neighbor test password test4
+        exit
+        exit
+        """
+    )
+
+    # Step 3: Verify the session is torn down (check both sides)
+    logger.info("Step 3: Verify session is torn down after password set")
+    test_func = partial(check_session_torn_down)
+    _, result = topotest.run_and_expect(test_func, None, count=30, wait=1)
+    assert result is None, f"Session was not torn down after password set: {result}"
+
+    # Step 4: Remove password from peer-group
+    logger.info("Step 4: Removing password with 'no neighbor test password' on ext-21")
+    ext21.vtysh_cmd(
+        """
+        configure terminal
+        router bgp 651006 vrf RED
+        no neighbor test password
+        exit
+        exit
+        """
+    )
+
+    # Step 5: Verify the dynamic neighbor re-establishes
+    logger.info(
+        "Step 5: Verify ext-21 dynamic neighbor re-establishes after password removal"
+    )
+    test_func = partial(check_ext21_established)
+    _, result = topotest.run_and_expect(test_func, None, count=120, wait=2)
+    assert result is None, (
+        f"ext-21 dynamic neighbor did not re-establish after password removal: "
+        f"{result}"
+    )
+
+    logger.info(
+        "ext-21 password test completed: dynamic neighbor correctly torn down "
+        "on password set and re-established after password removal"
+    )
 
 
 def test_memory_leak(tgen_and_ip_version):

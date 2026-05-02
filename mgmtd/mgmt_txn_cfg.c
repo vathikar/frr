@@ -62,6 +62,8 @@ struct txn_req_commit {
 	uint64_t clients;      /* interested clients */
 	uint64_t clients_wait; /* set when cfg_req sent */
 
+	char *info_msgs; /* darr: collected info messages from backends */
+
 	struct mgmt_commit_stats *cmt_stats;
 };
 #define as_commit(txn_req)                                                                        \
@@ -123,6 +125,7 @@ void txn_cfg_cleanup(struct txn_req *txn_req)
 	_dbg("Deleting COMMITCFG req-id: %Lu txn-id: %Lu", txn_req->req_id, txn_id);
 
 	XFREE(MTYPE_MGMTD_TXN_REQ, ccreq->edit);
+	darr_free(ccreq->info_msgs);
 
 	/* If we (still) had an internal nb transaction, abort it */
 	if (ccreq->mgmtd_nb_txn) {
@@ -298,7 +301,8 @@ static int txn_cfg_make_and_send_cfg_req(struct txn_req_commit *ccreq,
 		if (init_client_mask)
 			clients = init_client_mask;
 		else
-			clients = mgmt_be_interested_clients(xpath, MGMT_BE_XPATH_SUBSCR_TYPE_CFG);
+			clients = mgmt_be_interested_clients(xpath, MGMT_BE_XPATH_SUBSCR_TYPE_CFG,
+							     "SEND-CFG");
 		if (!clients)
 			_dbg("No backends interested in xpath: %s", xpath);
 
@@ -409,8 +413,8 @@ static int txn_cfg_make_and_send_cfg_req(struct txn_req_commit *ccreq,
 
 	if (ccreq->clients) {
 		/* set a timeout for hearing back from the backend clients */
-		_dbg("Setting timeout (%us) for backend client CFG_REPLY responses",
-		     MGMTD_TXN_CFG_COMMIT_MAX_DELAY_SEC);
+		_dbg("Set timeout (%us) for txn-id: %Lu backend client CFG_REPLYs",
+		     MGMTD_TXN_CFG_COMMIT_MAX_DELAY_SEC, txn_req->txn->txn_id);
 		event_add_timer(mm->master, txn_cfg_timeout, txn_req,
 				MGMTD_TXN_CFG_COMMIT_MAX_DELAY_SEC, &txn_req->timeout);
 	} else {
@@ -613,7 +617,7 @@ static void txn_cfg_next_phase(struct txn_req_commit *ccreq)
 	case MGMTD_COMMIT_PHASE_FINISH:
 		if (mm->perf_stats_en)
 			gettimeofday(&ccreq->cmt_stats->txn_del_start, NULL);
-		txn_finish_commit(ccreq, MGMTD_SUCCESS, NULL);
+		txn_finish_commit(ccreq, MGMTD_SUCCESS, ccreq->info_msgs);
 		return;
 	case MGMTD_COMMIT_PHASE_SEND_CFG:
 	default:
@@ -778,14 +782,33 @@ void mgmt_txn_handle_cfg_reply(uint64_t txn_id, struct mgmt_be_client_adapter *a
 /*
  * NOTE: can disconnect (and delete) the backend.
  */
-void mgmt_txn_handle_cfg_apply_reply(uint64_t txn_id, struct mgmt_be_client_adapter *adapter)
+void mgmt_txn_handle_cfg_apply_reply(uint64_t txn_id, struct mgmt_be_client_adapter *adapter,
+				     const char *errmsg)
 {
 	struct txn_req_commit *ccreq = txn_cfg_ensure_msg(txn_id, adapter, "CFG_APPLY");
 
-	if (!ccreq)
+	if (!ccreq) {
 		msg_conn_disconnect(adapter->conn, false);
-	else
-		txn_cfg_adapter_acked(ccreq, adapter);
+		return;
+	}
+
+	if (errmsg && errmsg[0]) {
+		char buf[BUFSIZ];
+		const char *src = adapter->name;
+		size_t i;
+
+		for (i = 0; i < sizeof(buf) - 1 && src[i]; i++)
+			buf[i] = toupper((unsigned char)src[i]);
+		buf[i] = '\0';
+
+		if (darr_strlen(ccreq->info_msgs))
+			darr_in_strcat(ccreq->info_msgs, "\n");
+		darr_in_strcat(ccreq->info_msgs, buf);
+		darr_in_strcat(ccreq->info_msgs, ": ");
+		darr_in_strcat(ccreq->info_msgs, errmsg);
+	}
+
+	txn_cfg_adapter_acked(ccreq, adapter);
 }
 
 /*

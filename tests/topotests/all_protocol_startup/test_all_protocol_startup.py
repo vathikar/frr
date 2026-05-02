@@ -26,10 +26,15 @@ pytestmark = [
     pytest.mark.babeld,
     pytest.mark.bgpd,
     pytest.mark.isisd,
+    pytest.mark.ldpd,
+    pytest.mark.mgmtd,
     pytest.mark.nhrpd,
+    pytest.mark.ospf6d,
     pytest.mark.ospfd,
     pytest.mark.pbrd,
     pytest.mark.ripd,
+    pytest.mark.ripngd,
+    pytest.mark.sharpd,
 ]
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -852,9 +857,8 @@ def test_ospfv2_interfaces():
             actual = re.sub(r"ifindex [0-9]+", "ifindex X", actual)
 
             # Drop time in next due
-            actual = re.sub(r"Hello due in [0-9\.]+s", "Hello due in XX.XXXs", actual)
             actual = re.sub(
-                r"Hello due in [0-9\.]+ usecs", "Hello due in XX.XXXs", actual
+                r"Hello due in [-0-9\.]+( usec)?s", "Hello due in XX.XXXs", actual
             )
             # Fix 'MTU mismatch detection: enabled' vs 'MTU mismatch detection:enabled' - accept both
             actual = re.sub(
@@ -1752,10 +1756,13 @@ def test_resilient_nexthop_group():
 
     # Use the json output and collect the nhg id from it
 
-    for nhgid in joutput:
-        n = joutput[nhgid]
-        if "buckets" in n:
-            break
+    n = {}
+    for jvrfname in joutput:
+        jvrf = joutput[jvrfname]
+        for nhgid in jvrf:
+            n = jvrf[nhgid]
+            if "buckets" in n:
+                break
 
     if "buckets" not in n:
         fatal_error = "Resilient NHG not found in json output"

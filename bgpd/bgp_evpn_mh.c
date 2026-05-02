@@ -100,6 +100,7 @@ void bgp_evpn_vtep_ip_to_attr_nh(const struct ipaddr *vtep_ip, struct attr *attr
 		attr->nexthop = vtep_ip->ipaddr_v4;
 		attr->mp_nexthop_global_in = vtep_ip->ipaddr_v4;
 		attr->mp_nexthop_len = BGP_ATTR_NHLEN_IPV4;
+		bgp_attr_set(attr, BGP_ATTR_NEXT_HOP);
 	} else if (IS_IPADDR_V6(vtep_ip)) {
 		IPV6_ADDR_COPY(&attr->mp_nexthop_global, &vtep_ip->ipaddr_v6);
 		attr->mp_nexthop_len = BGP_ATTR_NHLEN_IPV6_GLOBAL;
@@ -373,7 +374,7 @@ static int bgp_evpn_es_route_uninstall(struct bgp *bgp, struct bgp_evpn_es *es,
 	return ret;
 }
 
-/* Install or unistall a Type-4 route in the per-ES routing table */
+/* Install or uninstall a Type-4 route in the per-ES routing table */
 int bgp_evpn_es_route_install_uninstall(struct bgp *bgp, struct bgp_evpn_es *es,
 		afi_t afi, safi_t safi, struct prefix_evpn *evp,
 		struct bgp_path_info *pi, int install)
@@ -415,6 +416,31 @@ static void bgp_evpn_es_route_del_all(struct bgp *bgp, struct bgp_evpn_es *es)
 	     dest = bgp_route_next(dest)) {
 		for (pi = bgp_dest_get_bgp_path_info(dest);
 		     (pi != NULL) && (nextpi = pi->next, 1); pi = nextpi) {
+			bgp_path_info_mark_for_delete(dest, pi);
+			dest = bgp_path_info_reap(dest, pi);
+
+			assert(dest);
+		}
+	}
+}
+
+/* Purge all path-info entries from the ES table during daemon shutdown.
+ * The owning bgp instance may already have been deleted, so clear the
+ * table->bgp backpointer to avoid node teardown dereferencing freed state.
+ */
+static void bgp_evpn_es_route_table_purge(struct bgp_evpn_es *es)
+{
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi, *nextpi;
+
+	if (!es->route_table)
+		return;
+
+	es->route_table->bgp = NULL;
+
+	for (dest = bgp_table_top(es->route_table); dest; dest = bgp_route_next(dest)) {
+		for (pi = bgp_dest_get_bgp_path_info(dest); (pi != NULL) && (nextpi = pi->next, 1);
+		     pi = nextpi) {
 			bgp_path_info_mark_for_delete(dest, pi);
 			dest = bgp_path_info_reap(dest, pi);
 
@@ -845,9 +871,17 @@ int bgp_evpn_type4_route_process(struct peer *peer, afi_t afi, safi_t safi,
 	memcpy(&esi, pfx, ESI_BYTES);
 	pfx += ESI_BYTES;
 
-
 	/* Get the IP. */
 	ipaddr_len = *pfx++;
+
+	/* Validate */
+	if (psize != 19 + (ipaddr_len / 8)) {
+		flog_err(EC_BGP_EVPN_ROUTE_INVALID,
+			 "%u:%s - Rx EVPN Type-4 NLRI with invalid IP address length %d",
+			 peer->bgp->vrf_id, peer->host, ipaddr_len);
+		return -1;
+	}
+
 	if (ipaddr_len == IPV4_MAX_BITLEN) {
 		SET_IPADDR_V4(&vtep_ip);
 		memcpy(&vtep_ip.ipaddr_v4, pfx, IPV4_MAX_BYTELEN);
@@ -1419,7 +1453,7 @@ void bgp_evpn_mh_config_ead_export_rt(struct bgp *bgp,
  * 3. Local ESs are configured in zebra and sent to BGP
  * 4. Remote ESs are created by BGP when one or more ES-EVIs reference it i.e.
  *    created on first reference and release on last de-reference
- * 5. An ES can be both local and remote. Infact most local ESs are expected
+ * 5. An ES can be both local and remote. In fact most local ESs are expected
  *    to have an ES peer.
  */
 
@@ -3284,8 +3318,22 @@ void bgp_evpn_es_evi_vrf_ref(struct bgpevpn *vpn)
 	if (BGP_DEBUG(evpn_mh, EVPN_MH_ES))
 		zlog_debug("es-vrf ref for vni %u", vpn->vni);
 
-	RB_FOREACH (es_evi, bgp_es_evi_rb_head, &vpn->es_evi_rb_tree)
+	RB_FOREACH (es_evi, bgp_es_evi_rb_head, &vpn->es_evi_rb_tree) {
 		bgp_evpn_es_vrf_ref(es_evi, vpn->bgp_vrf);
+
+		/* Now that the VRF is updated for the ES-EVI, check if any local
+		 * route cleanup is required which was deferred earlier when the
+		 * VRF was not updated during local ESI creation.
+		 */
+		if (CHECK_FLAG(es_evi->flags, BGP_EVPNES_EVI_SWEEP_LOCAL_ROUTES) && es_evi->es_vrf) {
+			if (BGP_DEBUG(evpn_mh, EVPN_MH_RT))
+				zlog_debug("es %s vni %u: executing deferred route cleanup for vrf %s",
+					   es_evi->es->esi_str, vpn->vni,
+					   vpn->bgp_vrf->name_pretty);
+			UNSET_FLAG(es_evi->flags, BGP_EVPNES_EVI_SWEEP_LOCAL_ROUTES);
+			bgp_evpn_local_es_evi_uninstall_local_routes_in_vrfs(es_evi->es, es_evi);
+		}
+	}
 }
 
 /* 1. If ES-VRF is not present install the host route with the exploded/flat
@@ -5171,6 +5219,17 @@ void bgp_evpn_mh_init(void)
 	memset(&zero_esi_buf, 0, sizeof(esi_t));
 }
 
+void bgp_evpn_es_cleanup_routes(struct bgp *bgp)
+{
+	struct bgp_evpn_es *es;
+
+	if (!bgp_mh_info)
+		return;
+
+	RB_FOREACH (es, bgp_es_rb_head, &bgp_mh_info->es_rb_tree)
+		bgp_evpn_es_route_del_all(bgp, es);
+}
+
 void bgp_evpn_mh_finish(void)
 {
 	struct bgp_evpn_es *es;
@@ -5185,6 +5244,11 @@ void bgp_evpn_mh_finish(void)
 	 * cleanup here to ensure no memory leaks.
 	 */
 	RB_FOREACH_SAFE (es, bgp_es_rb_head, &bgp_mh_info->es_rb_tree, es_next) {
+		/* Reap any remaining ES-table paths so table pi_hash is empty
+		 * before bgp_table_unlock() in bgp_evpn_es_free().
+		 */
+		bgp_evpn_es_route_table_purge(es);
+
 		/* Force cleanup of any remaining structures that couldn't be
 		 * freed due to REMOTE flags or other guard conditions
 		 */
@@ -5278,8 +5342,14 @@ void bgp_evpn_local_es_evi_uninstall_local_routes_in_vrfs(struct bgp_evpn_es *es
 	const struct prefix_evpn *evp;
 	struct bgp_evpn_es_vrf *es_vrf = es_evi->es_vrf;
 
-	if (!es_vrf)
+	if (!es_vrf) {
+		/* VRF not available yet, mark for deferred cleanup once the VRF is updated */
+		if (BGP_DEBUG(evpn_mh, EVPN_MH_RT))
+			zlog_debug("es %s vni %u: VRF not available, marking for deferred route cleanup",
+				   es->esi_str, es_evi->vpn->vni);
+		SET_FLAG(es_evi->flags, BGP_EVPNES_EVI_SWEEP_LOCAL_ROUTES);
 		return;
+	}
 
 	for (ALL_LIST_ELEMENTS_RO(es->macip_global_path_list, node, es_info)) {
 		pi = es_info->pi;

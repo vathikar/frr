@@ -236,7 +236,7 @@ void pim_dm_recv_graft(struct interface *ifp, pim_sgaddr *sg)
 	struct pim_upstream *up;
 	struct pim_interface *pim_ifp = ifp->info;
 	pim_addr group_addr = sg->grp;
-	struct pim_ifchannel *ch;
+	struct pim_ifchannel *ch, *throwaway;
 
 	if (!pim_ifp || !pim_ifp->pim_enable)
 		return;
@@ -256,7 +256,7 @@ void pim_dm_recv_graft(struct interface *ifp, pim_sgaddr *sg)
 		oil_if_set(up->channel_oil, pim_ifp->mroute_vif_index, 1);
 		pim_upstream_mroute_update(up->channel_oil, __func__);
 
-		ch = pim_ifchannel_find(ifp, sg);
+		pim_ifchannel_find(ifp, sg, &ch, &throwaway);
 
 		if (ch) {
 			PIM_UPSTREAM_DM_UNSET_PRUNE(ch->flags);
@@ -283,7 +283,7 @@ void pim_dm_recv_prune(struct interface *ifp, struct pim_neighbor *neigh, uint16
 	struct pim_upstream *up;
 	struct pim_interface *pim_ifp;
 	pim_addr group_addr = sg->grp;
-	struct pim_ifchannel *ch;
+	struct pim_ifchannel *ch, *throwaway;
 
 	struct interface *ifp2 = NULL;
 	struct pim_interface *pim_ifp2;
@@ -332,7 +332,7 @@ void pim_dm_recv_prune(struct interface *ifp, struct pim_neighbor *neigh, uint16
 			prune_timer_start(up);
 		}
 
-		ch = pim_ifchannel_find(ifp, sg);
+		pim_ifchannel_find(ifp, sg, &ch, &throwaway);
 		if (!ch)
 			ch = pim_ifchannel_add(ifp, sg, source_flags,
 					       PIM_UPSTREAM_DM_FLAG_MASK_PRUNE);
@@ -431,7 +431,14 @@ bool pim_is_grp_dm(struct pim_instance *pim, pim_addr group_addr)
 	return pim_is_dm_prefix_filter(pim, group_addr);
 }
 
-
+/* Determine if a group should be considered as a dense mode group for a specific interface.
+ * A group is dense mode if it matches the following criteria:
+ *   1. Is NOT in the reserved groups range (224.0.0.0/24)
+ *   2. Is NOT in the SSM group range (default 232.0.0.0/8, or configured)
+ *   3. If interface is in sparse-dense mode, group is NOT covered by an RP (even if unreachable)
+ *   4. If a dense group filter list is configured, group is within the configured prefix list, if
+ *      no filter list is configured, then group is dense mode.
+ */
 bool pim_iface_grp_dm(struct pim_interface *pim_ifp, pim_addr group_addr)
 {
 	struct pim_rpf *rpg;
@@ -453,13 +460,12 @@ bool pim_iface_grp_dm(struct pim_interface *pim_ifp, pim_addr group_addr)
 		return false;
 
 	if (pim_ifp->pim_mode == PIM_MODE_SPARSE_DENSE) {
-		/*
-		 * check if it is an SM group
-		 * if we have an rp,
-		 * and the rp is reachable (I.e, we have source_nexthop.interface)
+		/* If the interface is configured in sparse-dense mode, then the group is sparse if it has
+		 * an RP discovered/configured, even if the RP is unreachable. Otherwise the group is a
+		 * dense group.
 		 */
 		rpg = RP(pim, group_addr);
-		if (rpg && rpg->source_nexthop.interface)
+		if (rpg && !pim_rpf_addr_is_inaddr_any(rpg))
 			return false;
 	}
 

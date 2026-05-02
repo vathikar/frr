@@ -71,6 +71,16 @@ enum bgp_show_adj_route_type {
 	"RPKI validation codes: V valid, I invalid, N Not found\n\n"
 #define BGP_SHOW_HEADER "     Network          Next Hop            Metric LocPrf Weight Path\n"
 #define BGP_SHOW_HEADER_WIDE "     Network                                      Next Hop                                  Metric LocPrf Weight Path\n"
+#define BGP_SHOW_BGP_LS_PREFIX_CODES_HEADER                                                                                \
+	"Prefix codes: E link, V node, T IP reachable route, S SRv6 SID, SP SRTE Policy, u/U unknown\n"                    \
+	"              I Identifier, N local node, R remote node, L link, P prefix, S SID, C candidate path\n"             \
+	"              L1/L2 ISIS level-1/level-2, O OSPF, O3 OSPFv3, D direct, ST static/peer-node, SR Segment Routing\n" \
+	"              a area-ID, l link-ID, t topology-ID, s ISO-ID,\n"                                                   \
+	"              c confed-ID/ASN, b bgp-identifier, r router-ID, te te-router-ID, sd SID\n"                          \
+	"              i if-address, n nbr-address, o OSPF Route-type, p IP-prefix\n"                                      \
+	"              d designated router address, po protocol-origin, f flag\n"                                          \
+	"              e endpoint-ip, cl color, as originator-asn oa originator-address\n"                                 \
+	"              di discriminator, q bgp-router-ID\n"
 
 /* Maximum number of sids we can process or send with a prefix. */
 #define BGP_MAX_SIDS 6
@@ -532,7 +542,7 @@ struct bgp_aggregate {
 	(!CHECK_FLAG((BI)->flags, BGP_PATH_HISTORY)                            \
 	 && !CHECK_FLAG((BI)->flags, BGP_PATH_REMOVED))
 
-/* Flags which indicate a route is unuseable in some form */
+/* Flags which indicate a route is unusable in some form */
 #define BGP_PATH_UNUSEABLE                                                     \
 	(BGP_PATH_HISTORY | BGP_PATH_DAMPED | BGP_PATH_REMOVED)
 /* Macro to check BGP information is alive or not.  Sadly,
@@ -662,17 +672,19 @@ static inline void prep_for_rmap_apply(struct bgp_path_info *dst_pi,
 				       struct peer *from, struct attr *attr)
 {
 	memset(dst_pi, 0, sizeof(struct bgp_path_info));
+	memset(dst_pie, 0, sizeof(struct bgp_path_info_extra));
 	dst_pi->peer = peer;
 	dst_pi->from = from;
 	dst_pi->attr = attr;
 	dst_pi->net = dest;
-	dst_pi->flags = src_pi->flags;
-	dst_pi->type = src_pi->type;
-	dst_pi->sub_type = src_pi->sub_type;
-	if (src_pi->extra) {
-		memcpy(dst_pie, src_pi->extra,
-		       sizeof(struct bgp_path_info_extra));
-		dst_pi->extra = dst_pie;
+	if (src_pi) {
+		dst_pi->flags = src_pi->flags;
+		dst_pi->type = src_pi->type;
+		dst_pi->sub_type = src_pi->sub_type;
+		if (src_pi->extra) {
+			memcpy(dst_pie, src_pi->extra, sizeof(struct bgp_path_info_extra));
+			dst_pi->extra = dst_pie;
+		}
 	}
 }
 

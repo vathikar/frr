@@ -53,9 +53,8 @@ tib_sg_oil_setup(struct pim_instance *pim, pim_sgaddr sg, struct interface *oif)
 
 	if (input_iface_vif_index < 1) {
 		if (PIM_DEBUG_GM_TRACE)
-			zlog_debug(
-				"%s %s: could not find input interface for %pSG",
-				__FILE__, __func__, &sg);
+			zlog_debug("%s %s: could not find vif index of interface with NH to RP for %pSG",
+				   __FILE__, __func__, &sg);
 
 		return pim_channel_oil_add(pim, &sg, __func__);
 	}
@@ -197,6 +196,7 @@ void tib_sg_gm_prune(struct pim_instance *pim, pim_sgaddr sg,
 {
 	int result;
 	struct pim_interface *pim_oif = oif->info;
+	struct channel_oil *live;
 
 	tib_sg_proxy_join_prune_check(pim, sg, oif, false);
 
@@ -216,6 +216,9 @@ void tib_sg_gm_prune(struct pim_instance *pim, pim_sgaddr sg,
 	 access an invalid pointer.
 	*/
 	if (pim->stopping)
+		return;
+
+	if (!*oilp)
 		return;
 
 	result = pim_channel_del_oif(*oilp, oif, PIM_OIF_FLAG_PROTO_GM,
@@ -254,5 +257,17 @@ void tib_sg_gm_prune(struct pim_instance *pim, pim_sgaddr sg,
 	 */
 	pim_ifchannel_local_membership_del(oif, &sg);
 
-	*oilp = pim_channel_oil_del(*oilp, __func__);
+	/*
+	 * local_membership_del may delete the ifchannel and last upstream,
+	 * which runs pim_channel_oil_upstream_deref() and frees the channel_oil.
+	 * IGMP still holds *oilp in that case; a second pim_channel_oil_del()
+	 * corrupts the RB tree (typed_rb_remove on freed / zeroed links).
+	 */
+
+	live = pim_find_channel_oil(pim, &sg);
+
+	if (live == *oilp)
+		*oilp = pim_channel_oil_del(live, __func__);
+	else
+		*oilp = NULL;
 }

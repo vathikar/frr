@@ -195,6 +195,15 @@ void pim_upstream_rpf_clear(struct pim_instance *pim,
 			    struct pim_upstream *up)
 {
 	if (up->rpf.source_nexthop.interface) {
+		struct pim_neighbor *nbr;
+
+		nbr = pim_neighbor_find(up->rpf.source_nexthop.interface,
+					up->rpf.rpf_addr, true);
+		if (nbr) {
+			pim_jp_agg_remove_group(nbr->upstream_jp_agg, up, nbr);
+			pim_jp_agg_upstream_verification(up, false);
+		}
+
 		pim_upstream_switch(pim, up, PIM_UPSTREAM_NOTJOINED);
 		up->rpf.source_nexthop.interface = NULL;
 		up->rpf.source_nexthop.mrib_nexthop_addr = PIMADDR_ANY;
@@ -224,7 +233,7 @@ void pim_upstream_rpf_clear(struct pim_instance *pim,
 */
 static pim_addr pim_rpf_find_rpf_addr(struct pim_upstream *up)
 {
-	struct pim_ifchannel *rpf_ch;
+	struct pim_ifchannel *rpf_ch, *throwaway;
 	struct pim_neighbor *neigh;
 	pim_addr rpf_addr;
 
@@ -235,7 +244,7 @@ static pim_addr pim_rpf_find_rpf_addr(struct pim_upstream *up)
 		return PIMADDR_ANY;
 	}
 
-	rpf_ch = pim_ifchannel_find(up->rpf.source_nexthop.interface, &up->sg);
+	pim_ifchannel_find(up->rpf.source_nexthop.interface, &up->sg, &rpf_ch, &throwaway);
 	if (rpf_ch) {
 		if (rpf_ch->ifassert_state == PIM_IFASSERT_I_AM_LOSER) {
 			return rpf_ch->ifassert_winner;

@@ -550,6 +550,7 @@ int zsend_redistribute_route(int cmd, struct zserv *client, const struct route_n
 		break;
 	case AFI_L2VPN:
 	case AFI_MAX:
+	case AFI_BGP_LS:
 	case AFI_UNSPEC:
 		break;
 	}
@@ -2150,7 +2151,7 @@ static void zread_route_add(ZAPI_HANDLER_ARGS)
 	struct nhg_backup_info *bnhg = NULL;
 	int ret;
 	vrf_id_t vrf_id;
-	struct nhg_hash_entry nhe, *n = NULL;
+	struct nhg_hash_entry nhe = { 0 }, *n = NULL;
 
 	s = msg;
 	if (zapi_route_decode(s, &api) < 0) {
@@ -2256,8 +2257,7 @@ static void zread_route_add(ZAPI_HANDLER_ARGS)
 		nhe.backup_info = bnhg;
 		n = zebra_nhe_copy(&nhe, 0);
 	}
-	ret = rib_add_multipath_nhe(afi, api.safi, &api.prefix, src_p, re, n,
-				    false);
+	ret = rib_add_multipath_nhe(afi, api.safi, &api.prefix, src_p, re, n, false, true);
 
 	/*
 	 * rib_add_multipath_nhe only fails in a couple spots
@@ -3097,7 +3097,7 @@ static void zread_srv6_manager_get_srv6_sid(struct zserv *client,
 	char locator[SRV6_LOCNAME_SIZE] = { 0 };
 	uint16_t len;
 	struct zebra_srv6_sid *sid = NULL;
-	uint8_t flags;
+	uint8_t flags = 0;
 	bool is_localonly = false;
 
 	/* Get input stream */
@@ -3178,7 +3178,7 @@ static void zread_srv6_manager_get_locator(struct zserv *client,
 					   struct stream *msg)
 {
 	struct stream *s = msg;
-	uint16_t len;
+	uint16_t len = 0;
 	char locator_name[SRV6_LOCNAME_SIZE] = { 0 };
 	struct srv6_locator *locator = NULL;
 
@@ -3902,8 +3902,7 @@ static inline void zebra_gre_get(ZAPI_HANDLER_ARGS)
 
 	zclient_create_header(s, ZEBRA_GRE_UPDATE, vrf_id);
 
-	if (ifp  && IS_ZEBRA_IF_GRE(ifp) && zebra_if) {
-		/* XXX TODO: other tunnels kinds should be handled */
+	if (ifp && IS_ZEBRA_IF_GRE(ifp) && zebra_if) {
 		gre_info = &zebra_if->l2info.gre;
 
 		stream_putl(s, idx);
@@ -3917,9 +3916,12 @@ static inline void zebra_gre_get(ZAPI_HANDLER_ARGS)
 		if (ifp_link)
 			vrf_id_link = ifp_link->vrf->vrf_id;
 		stream_putl(s, vrf_id_link);
-		stream_putl(s, gre_info->vtep_ip.s_addr);
-		stream_putl(s, gre_info->vtep_ip_remote.s_addr);
+		stream_putl(s, gre_info->vtep_ip.ipaddr_v4.s_addr);
+		stream_putl(s, gre_info->vtep_ip_remote.ipaddr_v4.s_addr);
 	} else {
+		/* XXX TODO: other tunnels kinds,
+		 * including IP6GRE tunnels should/should not  be handled
+		 */
 		stream_putl(s, idx);
 		stream_putl(s, 0);
 		stream_putl(s, 0);

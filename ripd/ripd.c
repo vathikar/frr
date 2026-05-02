@@ -722,6 +722,7 @@ static void rip_packet_dump(struct rip_packet *packet, int size,
 	const char *command_str;
 	uint8_t netmask = 0;
 	uint8_t *p;
+	char cbuf[RIP_RTE_SIZE];
 
 	/* Set command string. */
 	if (packet->command > 0 && packet->command < RIP_COMMAND_MAX)
@@ -745,10 +746,13 @@ static void rip_packet_dump(struct rip_packet *packet, int size,
 				    == htons(RIP_AUTH_SIMPLE_PASSWORD)) {
 					p = (uint8_t *)&rte->prefix;
 
-					zlog_debug(
-						"  family 0x%X type %d auth string: %s",
-						ntohs(rte->family),
-						ntohs(rte->tag), p);
+					/* Copy from packet to buffer */
+					memset(cbuf, 0, sizeof(cbuf));
+					memcpy(cbuf, p, RIP_RTE_SIZE - 4);
+
+					zlog_debug("  family 0x%X type %d auth string: %s",
+						   ntohs(rte->family),
+						   ntohs(rte->tag), cbuf);
 				} else if (rte->tag == htons(RIP_AUTH_MD5)) {
 					struct rip_md5_info *md5;
 
@@ -1173,7 +1177,7 @@ static void rip_response_process(struct rip_packet *packet, int size,
 	/* It is also worth checking to see whether the response is from one
 	   of the router's own addresses. */
 
-	; /* Alredy done in rip_read () */
+	; /* Already done in rip_read () */
 
 	/* Update RIP peer. */
 	rip_peer_update(rip, ri, from, packet->version);
@@ -1254,7 +1258,7 @@ static void rip_response_process(struct rip_packet *packet, int size,
 			if (!if_lookup_address((void *)&rte->nexthop, AF_INET,
 					       rip->vrf->vrf_id)) {
 				struct route_node *rn;
-				struct rip_info *rinfo;
+				struct rip_info *rinfo = NULL;
 				struct prefix p = { 0 };
 
 				p.family = AF_INET;
@@ -1264,11 +1268,11 @@ static void rip_response_process(struct rip_packet *packet, int size,
 				rn = route_node_match(rip->table, &p);
 
 				if (rn) {
-					rinfo = rn->info;
+					if (rn->info)
+						rinfo = rip_info_list_first(rn->info);
 
-					if (rinfo->type == ZEBRA_ROUTE_RIP
-					    && rinfo->sub_type
-						       == RIP_ROUTE_RTE) {
+					if (rinfo && rinfo->type == ZEBRA_ROUTE_RIP &&
+					    rinfo->sub_type == RIP_ROUTE_RTE) {
 						if (IS_RIP_DEBUG_EVENT)
 							zlog_debug(
 								"Next hop %pI4 is on RIP network.  Set nexthop to the packet's originator",
@@ -1667,7 +1671,7 @@ static void rip_request_process(struct rip_packet *packet, int size,
 	struct rip_info *rinfo;
 	struct rip_interface *ri;
 
-	/* Does not reponse to the requests on the loopback interfaces */
+	/* Does not response to the requests on the loopback interfaces */
 	if (if_is_loopback(ifc->ifp))
 		return;
 
@@ -1755,7 +1759,7 @@ static void rip_read(struct event *t)
 	/* Fetch socket then register myself. */
 	sock = EVENT_FD(t);
 
-	/* Add myself to tne next event */
+	/* Add myself to the next event */
 	rip_event(rip, RIP_READ, sock);
 
 	/* RIPd manages only IPv4. */
@@ -1770,7 +1774,7 @@ static void rip_read(struct event *t)
 		return;
 	}
 
-	/* Check is this packet comming from myself? */
+	/* Check is this packet coming from myself? */
 	if (if_check_address(rip, from.sin_addr)) {
 		if (IS_RIP_DEBUG_PACKET)
 			zlog_debug("ignore packet comes from myself (VRF %s)",
@@ -1913,7 +1917,7 @@ static void rip_read(struct event *t)
 	/* We make an exception for RIPv1 REQUEST packets, to which we'll
 	 * always reply regardless of authentication settings, because:
 	 *
-	 * - if there other authorised routers on-link, the REQUESTor can
+	 * - if there other authorised routers on-link, the requester can
 	 *   passively obtain the routing updates anyway
 	 * - if there are no other authorised routers on-link, RIP can
 	 *   easily be disabled for the link to prevent giving out information
@@ -2053,7 +2057,7 @@ static int rip_write_rte(int num, struct stream *s, struct prefix_ipv4 *p,
 	return ++num;
 }
 
-/* Send update to the ifp or spcified neighbor. */
+/* Send update to the ifp or specified neighbor. */
 void rip_output_process(struct connected *ifc, struct sockaddr_in *to,
 			int route_type, uint8_t version)
 {
@@ -2279,7 +2283,7 @@ void rip_output_process(struct connected *ifc, struct sockaddr_in *to,
 				rinfo->metric_out =
 					rip->redist[rinfo->type].metric;
 			} else {
-				/* If the route is not connected or localy
+				/* If the route is not connected or locally
 				 * generated one, use default-metric value
 				 */
 				if (rinfo->type != ZEBRA_ROUTE_RIP &&

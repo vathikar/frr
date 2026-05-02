@@ -12,12 +12,16 @@
 #ifndef _FRR_LINK_STATE_H_
 #define _FRR_LINK_STATE_H_
 
-#include "admin_group.h"
-#include "typesafe.h"
+#include "lib/typesafe.h"
+#include "lib/prefix.h"
+#include "lib/admin_group.h"
+#include "lib/iso.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+struct stream;
 
 /**
  * This file defines the model used to implement a Link State Database
@@ -107,12 +111,15 @@ extern int ls_node_id_same(struct ls_node_id i1, struct ls_node_id i2);
 #define LS_NODE_SRLB		0x0080
 #define LS_NODE_MSD		0x0100
 #define LS_NODE_SRV6		0x0200
+#define LS_NODE_ISIS_AREA_ID	0x0400
 
 /* Link State Node structure */
 struct ls_node {
 	uint16_t flags;			/* Flag for parameters validity */
 	struct ls_node_id adv;		/* Adv. Router of this Link State */
 	char name[MAX_NAME_LENGTH];	/* Name of the Node (IS-IS only) */
+	uint8_t isis_area_id_len;	/* Length of isis_area_id data */
+	uint8_t isis_area_id[ISO_ADDR_SIZE]; /* IS-IS Area ID */
 	struct in_addr router_id;	/* IPv4 Router ID */
 	struct in6_addr router_id6;	/* IPv6 Router ID */
 	uint8_t node_flag;		/* IS-IS or OSPF Node flag */
@@ -677,7 +684,7 @@ extern struct ls_edge *ls_find_edge_by_key(struct ls_ted *ted,
 
 /**
  * Find Edge in the Link State Data Base by the source (local IPv4 or IPv6
- * address or local ID) informations of the Link State Attributes
+ * address or local ID) information of the Link State Attributes
  *
  * @param ted		Link State Data Base
  * @param attributes	Link State Attributes

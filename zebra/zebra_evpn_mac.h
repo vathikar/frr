@@ -9,12 +9,23 @@
 #ifndef _ZEBRA_EVPN_MAC_H
 #define _ZEBRA_EVPN_MAC_H
 
-#include "zebra/zebra_evpn.h"
+#include <stdint.h>
+
+#include "lib/typesafe.h"
+#include "lib/linklist.h"
+#include "lib/hash.h"
+#include "lib/vlan.h"	/* vlanid_t */
+#include "lib/vxlan.h"	/* vni_t */
+#include "lib/prefix.h" /* esi_t, ethaddr */
+#include "lib/if.h"
+#include "lib/ns.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+typedef struct json_object json_object;
+struct l2vni_walk_ctx;
 
 struct host_rb_entry {
 	RB_ENTRY(host_rb_entry) hl_entry;
@@ -23,9 +34,6 @@ struct host_rb_entry {
 	uint32_t pathcnt;
 };
 
-RB_HEAD(host_rb_tree_entry, host_rb_entry);
-RB_PROTOTYPE(host_rb_tree_entry, host_rb_entry, hl_entry,
-	     host_rb_entry_compare);
 /*
  * MAC hash table.
  *
@@ -164,6 +172,10 @@ struct mac_walk_ctx {
 	bool print_dup;		  /* Used to print dup addr list */
 	bool gr_stale_cleanup;	  /* Used for cleaning up stale entries for GR */
 	uint64_t gr_cleanup_time;
+
+	/* Fields for incremental json output */
+	struct json_object *top_json;
+	uint32_t json_counter;
 };
 
 struct rmac_walk_ctx {
@@ -224,7 +236,7 @@ int zebra_evpn_macip_send_msg_to_client(uint32_t id,
 					const struct ipaddr *ip, uint8_t flags,
 					uint32_t seq, int state,
 					struct zebra_evpn_es *es, uint16_t cmd);
-void zebra_evpn_print_mac(struct zebra_mac *mac, void *ctxt, json_object *json);
+void zebra_evpn_print_mac(struct zebra_mac *mac, struct vty *vty, json_object *json);
 void zebra_evpn_print_mac_hash(struct hash_bucket *bucket, void *ctxt);
 void zebra_evpn_print_mac_hash_detail(struct hash_bucket *bucket, void *ctxt);
 int zebra_evpn_sync_mac_dp_install(struct zebra_mac *mac, bool set_inactive,

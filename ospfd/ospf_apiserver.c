@@ -20,8 +20,8 @@
 #include "log.h"
 #include "frrevent.h"
 #include "hash.h"
-#include "sockunion.h" /* for inet_aton() */
 #include "buffer.h"
+#include "lib/sockopt.h"
 
 #include <sys/types.h>
 
@@ -62,7 +62,7 @@ DEFINE_MTYPE_STATIC(OSPFD, APISERVER_MSGFILTER, "API Server Message Filter");
 /* List of all active connections. */
 struct list *apiserver_list;
 
-/* Indicates that API the server socket local addresss has been
+/* Indicates that API the server socket local address has been
  * specified.
  */
 struct in_addr ospf_apiserver_addr;
@@ -249,7 +249,7 @@ struct ospf_apiserver *ospf_apiserver_new(int fd_sync, int fd_async)
 	/* list of registered opaque types that application uses */
 	new->opaque_types = list_new();
 
-	/* Initialize temporary strage for LSA instances to be refreshed. */
+	/* Initialize temporary storage for LSA instances to be refreshed. */
 	if (IS_DEBUG_OSPF_CLIENT_API)
 		zlog_debug("API: Initiallize the reserve LSDB");
 	memset(&new->reserve, 0, sizeof(struct ospf_lsdb));
@@ -340,7 +340,7 @@ void ospf_apiserver_free(struct ospf_apiserver *apiserv)
 	msg_fifo_free(apiserv->out_sync_fifo);
 	msg_fifo_free(apiserv->out_async_fifo);
 
-	/* Clear temporary strage for LSA instances to be refreshed. */
+	/* Clear temporary storage for LSA instances to be refreshed. */
 	if (IS_DEBUG_OSPF_CLIENT_API)
 		zlog_debug("API: Delete all LSAs from reserve LSDB, total=%ld",
 			   apiserv->reserve.total);
@@ -557,7 +557,7 @@ int ospf_apiserver_serv_sock_family(unsigned short port, int family)
 	sockopt_reuseaddr(accept_sock);
 	sockopt_reuseport(accept_sock);
 
-	/* Bind socket to optional lcoal address and port. */
+	/* Bind socket to optional local address and port. */
 	if (ospf_apiserver_addr.s_addr)
 		sockunion2ip(&su) = ospf_apiserver_addr.s_addr;
 	rc = sockunion_bind(accept_sock, &su, port, &su);
@@ -1355,7 +1355,7 @@ out:
 
 /*
  * -----------------------------------------------------------
- * Followings are functions for synchronization.
+ * Following are functions for synchronization.
  * -----------------------------------------------------------
  */
 
@@ -1547,6 +1547,14 @@ struct ospf_lsa *ospf_apiserver_opaque_lsa_new(struct ospf_area *area,
 	if (!ospf)
 		return NULL;
 
+	if (!VALID_OPAQUE_INFO_LEN(protolsa)) {
+		if (IS_DEBUG_OSPF_CLIENT_API) {
+			zlog_debug("%s: invalid LSA input length %d, type %d", __func__,
+				   ntohs(protolsa->length), protolsa->type);
+		}
+		return NULL;
+	}
+
 	/* Create a stream for internal opaque LSA */
 	if ((s = stream_new(OSPF_MAX_LSA_SIZE)) == NULL) {
 		zlog_warn("%s: stream_new failed", __func__);
@@ -1636,9 +1644,32 @@ int ospf_apiserver_handle_originate_request(struct ospf_apiserver *apiserv,
 	if (!ospf)
 		goto out;
 
+	/* Validate size */
+	if (STREAM_READABLE(msg->s) < sizeof(struct msg_originate_request)) {
+		rc = OSPF_API_ERROR;
+		goto out;
+	}
+
 	/* Extract opaque LSA data from message */
 	omsg = (struct msg_originate_request *)STREAM_DATA(msg->s);
 	data = &omsg->data;
+
+	if (!VALID_OPAQUE_INFO_LEN(data)) {
+		zlog_warn("%s: invalid opaque LSA len %d", __func__, ntohs(data->length));
+		rc = OSPF_API_ERROR;
+		goto out;
+	}
+
+	/* Verify stream contains the full LSA body, not just the header */
+	if (STREAM_READABLE(msg->s) <
+	    offsetof(struct msg_originate_request, data) + ntohs(data->length)) {
+		zlog_warn("%s: message truncated, stream %zu < needed %zu", __func__,
+			  STREAM_READABLE(msg->s),
+			  (size_t)(offsetof(struct msg_originate_request, data) +
+				   (size_t)ntohs(data->length)));
+		rc = OSPF_API_ERROR;
+		goto out;
+	}
 
 	/* Determine interface for type9 or area for type10 LSAs. */
 	switch (data->type) {

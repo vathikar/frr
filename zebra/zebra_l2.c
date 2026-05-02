@@ -300,7 +300,7 @@ void zebra_l2_greif_add_update(struct interface *ifp,
 			       const struct zebra_l2info_gre *gre_info, int add)
 {
 	struct zebra_if *zif;
-	struct in_addr old_vtep_ip;
+	struct ipaddr old_vtep_ip;
 
 	zif = ifp->info;
 	assert(zif);
@@ -311,7 +311,7 @@ void zebra_l2_greif_add_update(struct interface *ifp,
 	}
 
 	old_vtep_ip = zif->l2info.gre.vtep_ip;
-	if (IPV4_ADDR_SAME(&old_vtep_ip, &gre_info->vtep_ip))
+	if (ipaddr_is_same(&old_vtep_ip, &gre_info->vtep_ip))
 		return;
 
 	zif->l2info.gre.vtep_ip = gre_info->vtep_ip;
@@ -476,6 +476,22 @@ void zebra_l2if_update_bridge_slave(struct interface *ifp,
 			zebra_vxlan_if_update(ifp, &ctx);
 		if (zif->es_info.es)
 			zebra_evpn_es_local_br_port_update(zif);
+
+		/* Remove the zif from all access-BD member lists while
+		 * brslave_info.br_if is still valid. zebra_evpn_vl_mbr_deref
+		 * needs br_if to locate the acc_bd; once
+		 * zebra_l2_unmap_slave_from_bridge clears br_if, the deref
+		 * can no longer find the acc_bd and the zif would be left
+		 * as a dangling pointer on acc_bd->mbr_zifs.
+		 */
+		if (bf_is_inited(zif->vlan_bitmap)) {
+			vlanid_t vid;
+
+			bf_for_each_set_bit(zif->vlan_bitmap, vid, IF_VLAN_BITMAP_MAX) {
+				zebra_evpn_vl_mbr_deref(vid, zif);
+			}
+		}
+
 		zebra_l2_unmap_slave_from_bridge(&zif->brslave_info);
 	}
 }

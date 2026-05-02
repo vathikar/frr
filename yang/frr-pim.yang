@@ -13,6 +13,10 @@ module frr-pim {
     prefix frr-interface;
   }
 
+  import frr-route-map {
+    prefix frr-route-map;
+  }
+
   import frr-routing {
     prefix "frr-rt";
   }
@@ -76,10 +80,14 @@ module frr-pim {
 
   typedef plist-ref {
     type string;
+    description
+      "Reference to a policy list.";
   }
 
   typedef access-list-ref {
     type string;
+    description
+      "Reference to an access list.";
   }
 
   /*
@@ -128,6 +136,9 @@ module frr-pim {
    */
 
   grouping msdp-timers {
+    description
+      "Grouping for MSDP timer configurations.";
+
     leaf hold-time {
       type uint16 {
         range "1..max";
@@ -191,8 +202,8 @@ module frr-pim {
 
     leaf authentication-key {
       when "../authentication-type = 'MD5'";
-      mandatory true;
       type string;
+      mandatory true;
       description
         "Authentication key.";
     }
@@ -257,6 +268,14 @@ module frr-pim {
       default "210";
       description
         "RP keep alive Timer in seconds.";
+    }
+
+    leaf gm-watermark-limit {
+      type uint16 {
+        range "1..max";
+      }
+      description
+        "Group count threshold for IGMP/MLD watermark warnings.";
     }
 
     leaf send-v6-secondary {
@@ -383,6 +402,9 @@ module frr-pim {
       list members {
         key "address";
 
+        description
+          "List of peer members associated with the configuration.";
+
         leaf address {
           type inet:ip-address;
           description
@@ -403,8 +425,8 @@ module frr-pim {
       }
 
       leaf source-ip {
-        mandatory true;
         type inet:ip-address;
+        mandatory true;
         description
           "MSDP source IP address.";
       }
@@ -437,8 +459,11 @@ module frr-pim {
     }
 
     container mlag {
-      presence
-        "Multi-chassis link aggregation.";
+     presence
+       "Multi-chassis link aggregation.";
+
+     description
+       "Configuration for mlag on the interface.";
 
      leaf peerlink-rif {
         type frr-interface:interface-ref;
@@ -488,6 +513,12 @@ module frr-pim {
         type plist-ref;
         description
           "Only accept registers from a specific source prefix list.";
+    }
+
+    leaf pim-join-route-map {
+      type frr-route-map:route-map-ref;
+      description
+        "Pass PIM joins through specified route-map.";
     }
   } // global-pim-config-attributes
 
@@ -589,9 +620,21 @@ module frr-pim {
         "Assert override interval in milliseconds. (calculated from assert interval by default)";
     }
 
+    leaf override-interval {
+      type uint16 {
+        range "0..65535";
+      }
+      default "2500";
+      description
+        "LAN prune delay override interval in milliseconds.";
+    }
+
     container bfd {
       presence
         "Enable BFD support on the interface.";
+
+      description
+        "Configuration for BFD on the interface.";
 
       leaf min-rx-interval {
         type uint16 {
@@ -646,6 +689,19 @@ module frr-pim {
       default "false";
       description
         "Mark interface as Active-Active for MLAG operations.";
+    }
+
+    leaf allow-rp {
+      type boolean;
+      default "false";
+      description
+        "Ignore mismatched RP addresses when processing (*,G) Joins.";
+    }
+
+    leaf allow-rp-rp-list {
+      type plist-ref;
+      description
+        "Prefix-list which the RP address must match to be accepted.";
     }
 
     leaf dr-priority {
@@ -732,6 +788,8 @@ module frr-pim {
    */
   augment "/frr-rt:routing/frr-rt:control-plane-protocols/"
         + "frr-rt:control-plane-protocol" {
+    description
+      "Augments the control plane protocol configuration to support pim configuration.";
     container pim {
       when "../frr-rt:type = 'frr-pim:pimd'" {
         description
@@ -755,7 +813,11 @@ module frr-pim {
    * Per-interface configuration data
    */
   augment "/frr-interface:lib/frr-interface:interface" {
+    description
+      "Augments the interface configuration to support pim configuration.";
     container pim {
+      description
+        "Configuration for pim on the interface.";
       list address-family {
         key "address-family";
         description

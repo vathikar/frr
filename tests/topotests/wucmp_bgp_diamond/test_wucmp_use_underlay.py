@@ -37,9 +37,9 @@ def build_topo(tgen):
     """
     Build a diamond topology:
           r1 (AS 65001)
-         /  \
+         / \\
         r2  r3 (AS 65002/65003)
-         \  /
+         \\ /
           r4 (AS 65004)
 
     All nodes have eBGP sessions with their directly connected peers.
@@ -277,6 +277,42 @@ def test_use_of_underlay_route():
     ), "Route 10.1.1.1/32 on r1 does not have expected underlay weights"
 
 
+def test_show_bgp_bestpath_json():
+    """
+    Test that 'show bgp bestpath json' command returns the correct bestpath settings.
+
+    Since r1 has 'bgp bestpath as-path multipath-relax' configured, the JSON output
+    should show asPathMultiPathRelax: true.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.gears["r1"]
+
+    step("Verify 'show bgp bestpath json' output on r1")
+
+    output = json.loads(r1.vtysh_cmd("show bgp bestpath json"))
+
+    # r1 has 'bgp bestpath as-path multipath-relax' configured
+    # Check that the JSON output reflects this
+    expected = {
+        "default": {
+            "bestPath": {
+                "asPathMultiPathRelax": True,
+                "asPathMultiPathRelaxAsSet": False,
+                "deterministicMed": False,
+            }
+        }
+    }
+
+    result = topotest.json_cmp(output, expected)
+    assert (
+        result is None
+    ), "show bgp bestpath json output does not match expected: {}".format(result)
+
+
 def test_modify_bandwidth_extended_community():
     """
     Test that modifying the bandwidth extended community changes the underlay weights.
@@ -346,6 +382,126 @@ def test_modify_bandwidth_extended_community():
     assert (
         result is None
     ), "Route 10.1.1.1/32 on r1 does not have expected updated weights after bandwidth change"
+
+
+def test_show_bgp_redistribute_json():
+    """
+    Test that 'show bgp vrf default ipv4 unicast redistribute json' command
+    returns the correct redistribute information.
+
+    Verifies:
+    1. Basic redistribute connected is shown correctly
+    2. Multiple OSPF instances are correctly shown as array in JSON
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.gears["r1"]
+
+    step("Verify 'show bgp vrf default ipv4 unicast redistribute json' output on r1")
+
+    output = json.loads(
+        r1.vtysh_cmd("show bgp vrf default ipv4 unicast redistribute json")
+    )
+
+    # r1 has 'redistribute connected' configured
+    # Check that the JSON output shows connected redistribution
+    # The command outputs redistribute info with array per route type
+    expected = {"redistribute": {"connected": [{}]}}
+
+    result = topotest.json_cmp(output, expected)
+    assert (
+        result is None
+    ), "show bgp redistribute json output does not match expected: {}".format(result)
+
+    step("Configure multiple OSPF instances and redistribute into BGP")
+
+    # Add two OSPF instances and redistribute both into BGP
+    r1.vtysh_cmd(
+        """
+    configure terminal
+    router ospf 1
+    exit
+    router ospf 2
+    exit
+    router bgp 65001
+     address-family ipv4 unicast
+      redistribute ospf 1 metric 100
+      redistribute ospf 2 metric 200
+    """
+    )
+
+    step("Verify JSON output shows both OSPF instances in array")
+
+    output = json.loads(
+        r1.vtysh_cmd("show bgp vrf default ipv4 unicast redistribute json")
+    )
+
+    # Should have array with 2 entries for OSPF
+    expected = {
+        "redistribute": {
+            "connected": [{}],
+            "ospf": [{"instance": 1, "metric": 100}, {"instance": 2, "metric": 200}],
+        }
+    }
+
+    result = topotest.json_cmp(output, expected)
+    assert (
+        result is None
+    ), "Multiple OSPF instances not shown correctly in JSON: {}".format(result)
+
+    step("Cleanup: remove OSPF instances and redistribution")
+
+    r1.vtysh_cmd(
+        """
+    configure terminal
+    router bgp 65001
+     address-family ipv4 unicast
+      no redistribute ospf 1
+      no redistribute ospf 2
+    exit
+    no router ospf 1
+    no router ospf 2
+    """
+    )
+
+
+def test_show_bgp_router_json():
+    """
+    Test that 'show bgp router json' command returns the new fields:
+    bgpGshutEnabled, bgpInMaintenanceMode, bgpWaitForFibSet,
+    bgpInputQueueLimit, bgpOutputQueueLimit, bgpUpdateDelayTime,
+    bgpEstablishWaitTime, bgpRmapDelayTimer.
+    """
+    tgen = get_topogen()
+
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.gears["r1"]
+
+    step("Verify 'show bgp router json' output contains new fields")
+
+    output = json.loads(r1.vtysh_cmd("show bgp router json"))
+
+    # Verify the new fields are present with expected default values
+    expected = {
+        "bgpGshutEnabled": False,
+        "bgpWaitForFibSet": False,
+        "bgpInputQueueLimit": 10000,
+        "bgpOutputQueueLimit": 10000,
+        "bgpUpdateDelayTime": 0,
+        "bgpEstablishWaitTime": 0,
+        "bgpRmapDelayTimer": 5,
+        "bgpRmapDelayTimerRemaining": 0,
+    }
+
+    result = topotest.json_cmp(output, expected)
+    assert (
+        result is None
+    ), "show bgp router json output does not match expected: {}".format(result)
 
 
 if __name__ == "__main__":

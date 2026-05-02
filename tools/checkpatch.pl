@@ -3247,7 +3247,7 @@ sub process {
 # A correctly formed commit description is:
 #    commit <SHA-1 hash length 12+ chars> ("Complete commit subject")
 # with the commit subject '("' prefix and '")' suffix
-# This is a fairly compilicated block as it tests for what appears to be
+# This is a fairly complicated block as it tests for what appears to be
 # bare SHA-1 hash with  minimum length of 5.  It also avoids several types of
 # possible SHA-1 matches.
 # A commit match can span multiple lines so this block attempts to find a
@@ -4673,6 +4673,7 @@ sub process {
 # check for new typedefs, only function parameters and sparse annotations
 # make sense.
 		if ($line =~ /\btypedef\s/ &&
+		    $line !~ /\btypedef.*\s(json_object|ns_id_t|vrf_id_t|vrf_bitmap_t|vlanid_t|ifindex_t|route_tag_t|as_t|atomptr_t|atomic_atomptr_t)\s*;/ &&
 		    $line !~ /\btypedef.*\s(pim_[^\s]+|[^\s]+_pim)\s*;/ &&
 		    $line !~ /\btypedef\s+$Type\s*\(\s*\*?$Ident\s*\)\s*\(/ &&
 		    $line !~ /\btypedef\s+$Type\s+$Ident\s*\(/ &&

@@ -1798,7 +1798,7 @@ static void *route_match_community_compile(const char *arg)
 {
 	struct rmap_community *rcom;
 	int len;
-	char *p;
+	const char *p;
 
 	rcom = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_community));
 
@@ -1895,7 +1895,7 @@ static void *route_match_lcommunity_compile(const char *arg)
 {
 	struct rmap_community *rcom;
 	int len;
-	char *p;
+	const char *p;
 
 	rcom = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_community));
 
@@ -1974,7 +1974,7 @@ static void *route_match_ecommunity_compile(const char *arg)
 {
 	struct rmap_community *rcom;
 	int len;
-	char *p;
+	const char *p;
 
 	rcom = XCALLOC(MTYPE_ROUTE_MAP_COMPILED, sizeof(struct rmap_community));
 
@@ -2694,8 +2694,8 @@ route_set_aspath_replace(void *rule, const struct prefix *dummy, void *object)
 	const char *replace = rule;
 	struct bgp_path_info *path = object;
 	as_t replace_asn = 0;
-	as_t configured_asn;
-	char *buf;
+	as_t configured_asn = 0;
+	const char *buf;
 	char src_asn[ASN_STRING_MAX_SIZE];
 	char *acl_list_name = NULL;
 	uint32_t acl_list_name_len = 0;
@@ -2718,7 +2718,7 @@ route_set_aspath_replace(void *rule, const struct prefix *dummy, void *object)
 		/* its as-path-acl-list command get the access list name */
 		while (*buf == ' ')
 			buf++;
-		buf_acl_name = buf;
+		buf_acl_name = (char *)buf;
 		buf = strchr(buf_acl_name, ' ');
 		if (buf)
 			acl_list_name_len = buf - buf_acl_name;
@@ -2877,7 +2877,7 @@ static void *route_set_community_compile(const char *arg)
 	if (strcmp(arg, "none") == 0)
 		none = 1;
 	else {
-		sp = strstr(arg, "additive");
+		sp = strstr((char *)arg, "additive");
 
 		if (sp && sp > arg) {
 			/* "additive" keyword is included.  */
@@ -2988,10 +2988,10 @@ static void *route_set_lcommunity_compile(const char *arg)
 	if (strcmp(arg, "none") == 0)
 		none = 1;
 	else {
-		sp = strstr(arg, "additive");
+		sp = strstr((char *)arg, "additive");
 
 		if (sp && sp > arg) {
-			/* "additive" keyworkd is included.  */
+			/* "additive" keyword is included.  */
 			additive = 1;
 			*(sp - 1) = '\0';
 		}
@@ -3250,8 +3250,8 @@ route_set_ecommunity_delete(void *rule, const struct prefix *prefix,
 static void *route_set_ecommunity_delete_compile(const char *arg)
 {
 	struct rmap_community *rcom;
-	char **splits;
-	int num;
+	char **splits = NULL;
+	int num = 0;
 
 	frrstr_split(arg, " ", &splits, &num);
 
@@ -3549,7 +3549,7 @@ static void *route_set_ecommunity_lb_compile(const char *arg)
 	uint8_t lb_type;
 	uint64_t bw = 0;
 	char bw_str[40] = {0};
-	char *p, *str;
+	const char *p, *str;
 	bool non_trans = false;
 
 	str = (char *)arg;
@@ -4717,9 +4717,8 @@ static void bgp_route_map_process_peer(const char *rmap_name,
 						"Processing route_map %s(%s:%s) update on peer %s (inbound, route-refresh)",
 						rmap_name, afi2str(afi),
 						safi2str(safi), peer->host);
-				bgp_route_refresh_send(
-					peer, afi, safi, 0, 0, 0,
-					BGP_ROUTE_REFRESH_NORMAL);
+				bgp_route_refresh_send(peer->connection, afi, safi, 0, 0, 0,
+						       BGP_ROUTE_REFRESH_NORMAL);
 			}
 		}
 	}
@@ -6956,7 +6955,7 @@ DEFUN_YANG (set_community,
 	}
 	XFREE(MTYPE_TMP, str);
 
-	/* Set communites attribute string.  */
+	/* Set communities attribute string.  */
 	str = community_str(com, false, false);
 
 	if (additive) {

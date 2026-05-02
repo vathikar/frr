@@ -337,12 +337,19 @@ static void pim_igmp_other_querier_expire(struct event *t)
 
 	assert(!igmp->t_igmp_query_timer);
 
-	if (PIM_DEBUG_GM_TRACE) {
-		char ifaddr_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<ifaddr?>", igmp->ifaddr, ifaddr_str,
-			       sizeof(ifaddr_str));
-		zlog_debug("%s: Querier %s resuming", __func__, ifaddr_str);
+	if (PIM_DEBUG_GM_TRACE)
+		zlog_debug("%s: Querier %pI4s resuming", __func__, &igmp->ifaddr);
+
+	/*
+	 * Adjust the querier robustness value to our own configuration if the
+	 * other querier is no longer present.
+	 */
+	if (igmp->t_other_querier_timer == NULL) {
+		struct pim_interface *pim_ifp = igmp->interface->info;
+
+		igmp->querier_robustness_variable = pim_ifp->gm_default_robustness_variable;
 	}
+
 	/* Mark the interface address as querier address */
 	igmp->querier_addr = igmp->ifaddr;
 
@@ -374,12 +381,8 @@ void pim_igmp_other_querier_timer_on(struct gm_sock *igmp)
 		*/
 
 		if (PIM_DEBUG_GM_TRACE) {
-			char ifaddr_str[INET_ADDRSTRLEN];
-			pim_inet4_dump("<ifaddr?>", igmp->ifaddr, ifaddr_str,
-				       sizeof(ifaddr_str));
-			zlog_debug(
-				"Querier %s resetting TIMER event for Other-Querier-Present",
-				ifaddr_str);
+			zlog_debug("Querier %pI4s resetting TIMER event for Other-Querier-Present",
+				   &igmp->ifaddr);
 		}
 		event_cancel(&igmp->t_other_querier_timer);
 	} else {
@@ -415,13 +418,9 @@ void pim_igmp_other_querier_timer_on(struct gm_sock *igmp)
 		pim_ifp->gm_query_max_response_time_dsec);
 
 	if (PIM_DEBUG_GM_TRACE) {
-		char ifaddr_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<ifaddr?>", igmp->ifaddr, ifaddr_str,
-			       sizeof(ifaddr_str));
-		zlog_debug(
-			"Querier %s scheduling %ld.%03ld sec TIMER event for Other-Querier-Present",
-			ifaddr_str, other_querier_present_interval_msec / 1000,
-			other_querier_present_interval_msec % 1000);
+		zlog_debug("Querier %pI4s scheduling %ld.%03ld sec TIMER event for Other-Querier-Present",
+			   &igmp->ifaddr, other_querier_present_interval_msec / 1000,
+			   other_querier_present_interval_msec % 1000);
 	}
 
 	event_add_timer_msec(router->master, pim_igmp_other_querier_expire,
@@ -435,12 +434,8 @@ void pim_igmp_other_querier_timer_off(struct gm_sock *igmp)
 
 	if (PIM_DEBUG_GM_TRACE) {
 		if (igmp->t_other_querier_timer) {
-			char ifaddr_str[INET_ADDRSTRLEN];
-			pim_inet4_dump("<ifaddr?>", igmp->ifaddr, ifaddr_str,
-				       sizeof(ifaddr_str));
-			zlog_debug(
-				"IGMP querier %s fd=%d cancelling other-querier-present TIMER event on %s",
-				ifaddr_str, igmp->fd, igmp->interface->name);
+			zlog_debug("IGMP querier %pI4s fd=%d cancelling other-querier-present TIMER event on %s",
+				   &igmp->ifaddr, igmp->fd, igmp->interface->name);
 		}
 	}
 	event_cancel(&igmp->t_other_querier_timer);
@@ -467,10 +462,8 @@ int igmp_validate_checksum(char *igmp_msg, int igmp_msg_len)
 	return 0;
 }
 
-static int igmp_recv_query(struct gm_sock *igmp, int query_version,
-			   int max_resp_code, struct in_addr from,
-			   const char *from_str, char *igmp_msg,
-			   int igmp_msg_len)
+static int igmp_recv_query(struct gm_sock *igmp, int query_version, int max_resp_code,
+			   struct in_addr from, char *igmp_msg, int igmp_msg_len)
 {
 	struct interface *ifp;
 	struct pim_interface *pim_ifp;
@@ -485,23 +478,22 @@ static int igmp_recv_query(struct gm_sock *igmp, int query_version,
 	pim_ifp = ifp->info;
 
 	if (igmp_validate_checksum(igmp_msg, igmp_msg_len) == -1) {
-		zlog_warn(
-			"Recv IGMP query v%d from %s on %s with invalid checksum",
-			query_version, from_str, ifp->name);
+		zlog_warn("Recv IGMP query v%d from %pI4s on %s with invalid checksum",
+			  query_version, &from, ifp->name);
 		return -1;
 	}
 
 	if (!pim_if_connected_to_source(ifp, from)) {
 		if (PIM_DEBUG_GM_PACKETS)
-			zlog_debug("Recv IGMP query on interface: %s from a non-connected source: %s",
-				   ifp->name, from_str);
+			zlog_debug("Recv IGMP query on interface: %s from a non-connected source: %pI4s",
+				   ifp->name, &from);
 		return 0;
 	}
 
 	if (if_address_is_local(&from, AF_INET, ifp->vrf->vrf_id)) {
 		if (PIM_DEBUG_GM_PACKETS)
-			zlog_debug("Recv IGMP query on interface: %s from ourself %s",
-				   ifp->name, from_str);
+			zlog_debug("Recv IGMP query on interface: %s from ourself %pI4s",
+				   ifp->name, &from);
 		return 0;
 	}
 
@@ -538,19 +530,14 @@ static int igmp_recv_query(struct gm_sock *igmp, int query_version,
 	 * configure all PIM routers to use the same version of IGMP.
 	 */
 	if (query_version != pim_ifp->igmp_version) {
-		zlog_warn(
-			"Recv IGMP query v%d from %s on %s but we are using v%d, please configure all PIM routers on this subnet to use the same IGMP version",
-			query_version, from_str, ifp->name,
-			pim_ifp->igmp_version);
+		zlog_warn("Recv IGMP query v%d from %pI4s on %s but we are using v%d, please configure all PIM routers on this subnet to use the same IGMP version",
+			  query_version, &from, ifp->name, pim_ifp->igmp_version);
 		return 0;
 	}
 
 	if (PIM_DEBUG_GM_PACKETS) {
-		char group_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<group?>", group_addr, group_str,
-			       sizeof(group_str));
-		zlog_debug("Recv IGMP query v%d from %s on %s for group %s",
-			   query_version, from_str, ifp->name, group_str);
+		zlog_debug("Recv IGMP query v%d from %pI4s on %s for group %pI4s", query_version,
+			   &from, ifp->name, &group_addr);
 	}
 
 	/*
@@ -585,21 +572,15 @@ static int igmp_recv_query(struct gm_sock *igmp, int query_version,
 				continue;
 
 			if (PIM_DEBUG_GM_TRACE)
-				zlog_debug(
-					"%s: lower address query packet from %s is ignored when last member query interval timer is running",
-					ifp->name, from_str);
+				zlog_debug("%s: lower address query packet from %pI4s is ignored when last member query interval timer is running",
+					   ifp->name, &from);
 			return 0;
 		}
 
 		if (PIM_DEBUG_GM_TRACE) {
-			char ifaddr_str[INET_ADDRSTRLEN];
-			pim_inet4_dump("<ifaddr?>", igmp->ifaddr, ifaddr_str,
-				       sizeof(ifaddr_str));
-			zlog_debug(
-				"%s: local address %s (%u) lost querier election to %s (%u)",
-				ifp->name, ifaddr_str,
-				ntohl(igmp->ifaddr.s_addr), from_str,
-				ntohl(from.s_addr));
+			zlog_debug("%s: local address %pI4s (%u) lost querier election to %pI4s (%u)",
+				   ifp->name, &igmp->ifaddr, ntohl(igmp->ifaddr.s_addr), &from,
+				   ntohl(from.s_addr));
 		}
 		/* Reset the other querier timer only if query is received from
 		 * the previously elected querier or a better new querier
@@ -616,7 +597,7 @@ static int igmp_recv_query(struct gm_sock *igmp, int query_version,
 
 	/* IGMP version 3 is the only one where we process the RXed query */
 	if (query_version == 3) {
-		igmp_v3_recv_query(igmp, from_str, igmp_msg);
+		igmp_v3_recv_query(igmp, from, igmp_msg, igmp_msg_len);
 	}
 
 	return 0;
@@ -625,15 +606,11 @@ static int igmp_recv_query(struct gm_sock *igmp, int query_version,
 static void on_trace(const char *label, struct interface *ifp,
 		     struct in_addr from)
 {
-	if (PIM_DEBUG_GM_TRACE) {
-		char from_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<from?>", from, from_str, sizeof(from_str));
-		zlog_debug("%s: from %s on %s", label, from_str, ifp->name);
-	}
+	if (PIM_DEBUG_GM_TRACE)
+		zlog_debug("%s: from %pI4s on %s", label, &from, ifp->name);
 }
 
-static int igmp_v1_recv_report(struct gm_sock *igmp, struct in_addr from,
-			       const char *from_str, char *igmp_msg,
+static int igmp_v1_recv_report(struct gm_sock *igmp, struct in_addr from, char *igmp_msg,
 			       int igmp_msg_len)
 {
 	struct interface *ifp = igmp->interface;
@@ -646,16 +623,14 @@ static int igmp_v1_recv_report(struct gm_sock *igmp, struct in_addr from,
 		return 0;
 
 	if (igmp_msg_len != IGMP_V12_MSG_SIZE) {
-		zlog_warn(
-			"Recv IGMP report v1 from %s on %s: size=%d other than correct=%d",
-			from_str, ifp->name, igmp_msg_len, IGMP_V12_MSG_SIZE);
+		zlog_warn("Recv IGMP report v1 from %pI4s on %s: size=%d other than correct=%d",
+			  &from, ifp->name, igmp_msg_len, IGMP_V12_MSG_SIZE);
 		return -1;
 	}
 
 	if (igmp_validate_checksum(igmp_msg, igmp_msg_len) == -1) {
-		zlog_warn(
-			"Recv IGMP report v1 from %s on %s with invalid checksum",
-			from_str, ifp->name);
+		zlog_warn("Recv IGMP report v1 from %pI4s on %s with invalid checksum", &from,
+			  ifp->name);
 		return -1;
 	}
 
@@ -688,6 +663,7 @@ bool pim_igmp_verify_header(struct ip *ip_hdr, size_t len, size_t *hlen)
 	int igmp_msg_len;
 	int msg_type;
 	size_t ip_hlen; /* ip header length in bytes */
+	uint16_t ip_total;
 
 	if (len < sizeof(*ip_hdr)) {
 		zlog_warn("IGMP packet size=%zu shorter than minimum=%zu", len,
@@ -705,15 +681,42 @@ bool pim_igmp_verify_header(struct ip *ip_hdr, size_t len, size_t *hlen)
 		return false;
 	}
 
+	/*
+	 * Reject if the IPv4 total length is larger than what we received
+	 * (e.g. recvmsg truncated a jumbo/reassembled datagram into buf[]).
+	 * Otherwise downstream code must not trust ip_len for sendto() length.
+	 */
+	ip_total = ntohs(ip_hdr->ip_len);
+
+	if (ip_total < sizeof(struct ip)) {
+		zlog_warn("IGMP packet ip_len=%u shorter than minimum IPv4 header", ip_total);
+		return false;
+	}
+	if (ip_total < ip_hlen) {
+		zlog_warn("IGMP packet ip_len=%u shorter than header length %zu", ip_total,
+			  ip_hlen);
+		return false;
+	}
+	if (ip_total > len) {
+		zlog_warn("IGMP packet ip_len=%u exceeds received length %zu (truncated or corrupt)",
+			  ip_total, len);
+		return false;
+	}
+
 	igmp_msg = (char *)ip_hdr + ip_hlen;
-	igmp_msg_len = len - ip_hlen;
-	msg_type = *igmp_msg;
+	/*
+	 * Use datagram length from ip_hdr, not recv buffer length (len may
+	 * include link-layer padding past ip_total).
+	 */
+	igmp_msg_len = ip_total - ip_hlen;
 
 	if (igmp_msg_len < PIM_IGMP_MIN_LEN) {
 		zlog_warn("IGMP message size=%d shorter than minimum=%d",
 			  igmp_msg_len, PIM_IGMP_MIN_LEN);
 		return false;
 	}
+
+	msg_type = *igmp_msg;
 
 	if ((msg_type != PIM_IGMP_MTRACE_RESPONSE)
 	    && (msg_type != PIM_IGMP_MTRACE_QUERY_REQUEST)) {
@@ -752,15 +755,16 @@ int pim_igmp_packet(struct gm_sock *igmp, char *buf, size_t len)
 	const struct pim_interface *pim_interface = igmp->interface->info;
 	struct ip *ip_hdr = (struct ip *)buf;
 	size_t ip_hlen; /* ip header length in bytes */
+	uint16_t ip_total;
 	char *igmp_msg;
 	int igmp_msg_len;
 	int msg_type;
 	bool router_alert;
-	char from_str[INET_ADDRSTRLEN];
-	char to_str[INET_ADDRSTRLEN];
 
 	if (!pim_igmp_verify_header(ip_hdr, len, &ip_hlen))
 		return -1;
+
+	ip_total = ntohs(ip_hdr->ip_len);
 
 	if (ip_hlen > sizeof(struct ip)) {
 		const uint8_t *ip_options = (const uint8_t *)(ip_hdr + 1);
@@ -781,17 +785,14 @@ int pim_igmp_packet(struct gm_sock *igmp, char *buf, size_t len)
 	}
 
 	igmp_msg = buf + ip_hlen;
-	igmp_msg_len = len - ip_hlen;
+	/* Same as pim_igmp_verify_header(): use ip_total, not recv len (padding). */
+	igmp_msg_len = (int)(ip_total - ip_hlen);
 	msg_type = *igmp_msg;
 
-	pim_inet4_dump("<src?>", ip_hdr->ip_src, from_str, sizeof(from_str));
-	pim_inet4_dump("<dst?>", ip_hdr->ip_dst, to_str, sizeof(to_str));
-
 	if (PIM_DEBUG_GM_PACKETS) {
-		zlog_debug(
-			"Recv IGMP packet from %s to %s on %s: size=%zu ttl=%d msg_type=%d msg_size=%d",
-			from_str, to_str, igmp->interface->name, len, ip_hdr->ip_ttl,
-			msg_type, igmp_msg_len);
+		zlog_debug("Recv IGMP packet from %pI4s to %pI4s on %s: size=%zu ttl=%d msg_type=%d msg_size=%d",
+			   &ip_hdr->ip_src, &ip_hdr->ip_dst, igmp->interface->name, len,
+			   ip_hdr->ip_ttl, msg_type, igmp_msg_len);
 	}
 
 	switch (msg_type) {
@@ -817,34 +818,28 @@ int pim_igmp_packet(struct gm_sock *igmp, char *buf, size_t len)
 			return -1;
 		}
 
-		return igmp_recv_query(igmp, query_version, max_resp_code,
-				       ip_hdr->ip_src, from_str, igmp_msg,
-				       igmp_msg_len);
+		return igmp_recv_query(igmp, query_version, max_resp_code, ip_hdr->ip_src,
+				       igmp_msg, igmp_msg_len);
 	}
 
 	case PIM_IGMP_V3_MEMBERSHIP_REPORT:
-		return igmp_v3_recv_report(igmp, ip_hdr->ip_src, from_str,
-					   igmp_msg, igmp_msg_len);
+		return igmp_v3_recv_report(igmp, ip_hdr->ip_src, igmp_msg, igmp_msg_len);
 
 	case PIM_IGMP_V2_MEMBERSHIP_REPORT:
-		return igmp_v2_recv_report(igmp, ip_hdr->ip_src, ip_hdr->ip_dst, from_str,
-					   igmp_msg, igmp_msg_len);
+		return igmp_v2_recv_report(igmp, ip_hdr->ip_src, ip_hdr->ip_dst, igmp_msg,
+					   igmp_msg_len);
 
 	case PIM_IGMP_V1_MEMBERSHIP_REPORT:
-		return igmp_v1_recv_report(igmp, ip_hdr->ip_src, from_str,
-					   igmp_msg, igmp_msg_len);
+		return igmp_v1_recv_report(igmp, ip_hdr->ip_src, igmp_msg, igmp_msg_len);
 
 	case PIM_IGMP_V2_LEAVE_GROUP:
-		return igmp_v2_recv_leave(igmp, ip_hdr, from_str, igmp_msg,
-					  igmp_msg_len);
+		return igmp_v2_recv_leave(igmp, ip_hdr, igmp_msg, igmp_msg_len);
 
 	case PIM_IGMP_MTRACE_RESPONSE:
-		return igmp_mtrace_recv_response(igmp, ip_hdr, ip_hdr->ip_src,
-						 from_str, igmp_msg,
+		return igmp_mtrace_recv_response(igmp, ip_hdr, ip_hdr->ip_src, igmp_msg,
 						 igmp_msg_len);
 	case PIM_IGMP_MTRACE_QUERY_REQUEST:
-		return igmp_mtrace_recv_qry_req(igmp, ip_hdr, ip_hdr->ip_src,
-						from_str, igmp_msg,
+		return igmp_mtrace_recv_qry_req(igmp, ip_hdr, ip_hdr->ip_src, igmp_msg,
 						igmp_msg_len);
 	}
 
@@ -900,13 +895,9 @@ void pim_igmp_general_query_on(struct gm_sock *igmp)
 	}
 
 	if (PIM_DEBUG_GM_TRACE) {
-		char ifaddr_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<ifaddr?>", igmp->ifaddr, ifaddr_str,
-			       sizeof(ifaddr_str));
-		zlog_debug(
-			"Querier %s scheduling %d-second (%s) TIMER event for IGMP query on fd=%d",
-			ifaddr_str, query_interval,
-			startup_mode ? "startup" : "non-startup", igmp->fd);
+		zlog_debug("Querier %pI4s scheduling %d-second (%s) TIMER event for IGMP query on fd=%d",
+			   &igmp->ifaddr, query_interval, startup_mode ? "startup" : "non-startup",
+			   igmp->fd);
 	}
 	event_add_timer(router->master, pim_igmp_general_query, igmp,
 			query_interval, &igmp->t_igmp_query_timer);
@@ -918,12 +909,8 @@ void pim_igmp_general_query_off(struct gm_sock *igmp)
 
 	if (PIM_DEBUG_GM_TRACE) {
 		if (igmp->t_igmp_query_timer) {
-			char ifaddr_str[INET_ADDRSTRLEN];
-			pim_inet4_dump("<ifaddr?>", igmp->ifaddr, ifaddr_str,
-				       sizeof(ifaddr_str));
-			zlog_debug(
-				"IGMP querier %s fd=%d cancelling query TIMER event on %s",
-				ifaddr_str, igmp->fd, igmp->interface->name);
+			zlog_debug("IGMP querier %pI4s fd=%d cancelling query TIMER event on %s",
+				   &igmp->ifaddr, igmp->fd, igmp->interface->name);
 		}
 	}
 	event_cancel(&igmp->t_igmp_query_timer);
@@ -965,15 +952,9 @@ static void pim_igmp_general_query(struct event *t)
 	dst_addr.s_addr = htonl(INADDR_ALLHOSTS_GROUP);
 	group_addr.s_addr = PIM_NET_INADDR_ANY;
 
-	if (PIM_DEBUG_GM_TRACE) {
-		char querier_str[INET_ADDRSTRLEN];
-		char dst_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<querier?>", igmp->ifaddr, querier_str,
-			       sizeof(querier_str));
-		pim_inet4_dump("<dst?>", dst_addr, dst_str, sizeof(dst_str));
-		zlog_debug("Querier %s issuing IGMP general query to %s on %s",
-			   querier_str, dst_str, igmp->interface->name);
-	}
+	if (PIM_DEBUG_GM_TRACE)
+		zlog_debug("Querier %pI4s issuing IGMP general query to %pI4s on %s",
+			   &igmp->ifaddr, &dst_addr, igmp->interface->name);
 
 	igmp_send_query(pim_ifp->igmp_version, 0 /* igmp_group */, query_buf,
 			sizeof(query_buf), 0 /* num_sources */, dst_addr,
@@ -1078,11 +1059,8 @@ void igmp_group_delete(struct gm_group *group)
 
 
 	if (PIM_DEBUG_GM_TRACE) {
-		char group_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<group?>", group->group_addr, group_str,
-			       sizeof(group_str));
-		zlog_debug("Deleting IGMP group %s from interface %s",
-			   group_str, group->interface->name);
+		zlog_debug("Deleting IGMP group %pI4s from interface %s", &group->group_addr,
+			   group->interface->name);
 	}
 
 	for (ALL_LIST_ELEMENTS(group->group_source_list, src_node, src_nextnode,
@@ -1352,11 +1330,8 @@ static void igmp_group_timer(struct event *t)
 	group = EVENT_ARG(t);
 
 	if (PIM_DEBUG_GM_TRACE) {
-		char group_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<group?>", group->group_addr, group_str,
-			       sizeof(group_str));
-		zlog_debug("%s: Timer for group %s on interface %s", __func__,
-			   group_str, group->interface->name);
+		zlog_debug("%s: Timer for group %pI4s on interface %s", __func__,
+			   &group->group_addr, group->interface->name);
 	}
 
 	assert(group->group_filtermode_isexcl);
@@ -1387,11 +1362,8 @@ static void group_timer_off(struct gm_group *group)
 		return;
 
 	if (PIM_DEBUG_GM_TRACE) {
-		char group_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<group?>", group->group_addr, group_str,
-			       sizeof(group_str));
-		zlog_debug("Cancelling TIMER event for group %s on %s",
-			   group_str, group->interface->name);
+		zlog_debug("Cancelling TIMER event for group %pI4s on %s", &group->group_addr,
+			   group->interface->name);
 	}
 	event_cancel(&group->t_group_timer);
 }
@@ -1418,13 +1390,8 @@ void igmp_group_timer_on(struct gm_group *group, long interval_msec,
 	group_timer_off(group);
 
 	if (PIM_DEBUG_GM_EVENTS) {
-		char group_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<group?>", group->group_addr, group_str,
-			       sizeof(group_str));
-		zlog_debug(
-			"Scheduling %ld.%03ld sec TIMER event for group %s on %s",
-			interval_msec / 1000, interval_msec % 1000, group_str,
-			ifname);
+		zlog_debug("Scheduling %ld.%03ld sec TIMER event for group %pI4s on %s",
+			   interval_msec / 1000, interval_msec % 1000, &group->group_addr, ifname);
 	}
 
 	/*
@@ -1484,7 +1451,7 @@ struct gm_group *igmp_add_group_by_addr(struct gm_sock *igmp,
 	}
 
 	/*
-	  Non-existant group is created as INCLUDE {empty}:
+	  Non-existent group is created as INCLUDE {empty}:
 
 	  RFC 3376 - 5.1. Action on Change of Interface State
 
@@ -1518,12 +1485,8 @@ struct gm_group *igmp_add_group_by_addr(struct gm_sock *igmp,
 	group = hash_get(pim_ifp->gm_group_hash, group, hash_alloc_intern);
 
 	if (PIM_DEBUG_GM_TRACE) {
-		char group_str[INET_ADDRSTRLEN];
-		pim_inet4_dump("<group?>", group->group_addr, group_str,
-			       sizeof(group_str));
-		zlog_debug(
-			"Creating new IGMP group %s on socket %d interface %s",
-			group_str, igmp->fd, igmp->interface->name);
+		zlog_debug("Creating new IGMP group %pI4s on socket %d interface %s",
+			   &group->group_addr, igmp->fd, igmp->interface->name);
 	}
 
 	igmp_group_count_incr(pim_ifp);

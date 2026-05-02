@@ -395,7 +395,7 @@ state:
 	msg->refer_id = txn_id;
 	msg->req_id = req_id;
 	msg->code = MGMT_MSG_CODE_GET_TREE;
-#if (LY_VERSION_MAJOR < 4)
+#if (LY_VERSION_MAJOR < 4) || (LY_VERSION_MAJOR >= 5)
 	/* Always operate with the binary format in the backend */
 	msg->result_type = LYD_LYB;
 #else
@@ -588,7 +588,7 @@ void mgmt_txn_send_rpc(uint64_t txn_id, uint64_t req_id, uint64_t clients, LYD_F
 /* =========================== */
 
 void mgmt_txn_send_notify_selectors(uint64_t req_id, uint64_t session_id, uint64_t clients,
-				    const char **selectors)
+				    bool subscribing, const char **selectors)
 {
 	struct mgmt_be_client_adapter *adapter;
 	struct mgmt_msg_notify_select *msg;
@@ -603,6 +603,14 @@ void mgmt_txn_send_notify_selectors(uint64_t req_id, uint64_t session_id, uint64
 	msg->code = MGMT_MSG_CODE_NOTIFY_SELECT;
 	msg->replace = selectors == NULL;
 	msg->get_only = session_id != MGMTD_SESSION_ID_NONE;
+	msg->subscribing = subscribing;
+	/*
+	 * MGMTd owns periodic scheduling for FE sessions. Backend selector-update
+	 * messages stay in on-change mode; periodic behavior is driven by MGMTd's
+	 * per-session timer and get_only polling flow.
+	 */
+	msg->mode = NOTIFY_MODE_ON_CHANGE;
+	msg->mode_data = 0;
 
 	if (selectors == NULL) {
 		/* Get selectors for all sessions */

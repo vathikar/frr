@@ -106,7 +106,7 @@ static void vrrp_recalculate_timers(struct vrrp_router *r)
  * master/backup status.
  *
  * ifp
- *    The interface to check owernship of. This should be the base interface of
+ *    The interface to check ownership of. This should be the base interface of
  *    a VRRP router.
  *
  * vr
@@ -916,6 +916,8 @@ static int vrrp_recv_advertisement(struct vrrp_router *r, struct ipaddr *src,
 			if (r->vr->version == 3) {
 				r->master_adver_interval =
 					htons(pkt->hdr.v3.adver_int);
+				/* Limit to 12 bits */
+				r->master_adver_interval &= 0x0FFF;
 			}
 			vrrp_recalculate_timers(r);
 			event_cancel(&r->t_master_down_timer);
@@ -944,6 +946,8 @@ static int vrrp_recv_advertisement(struct vrrp_router *r, struct ipaddr *src,
 			if (r->vr->version == 3) {
 				r->master_adver_interval =
 					ntohs(pkt->hdr.v3.adver_int);
+				/* Limit to 12 bits */
+				r->master_adver_interval &= 0x0FFF;
 			}
 			vrrp_recalculate_timers(r);
 			event_cancel(&r->t_master_down_timer);
@@ -1177,7 +1181,15 @@ static int vrrp_socket(struct vrrp_router *r)
 			if (c->address->family == AF_INET)
 				break;
 
-		assert(c);
+		if (c == NULL) {
+			zlog_err(VRRP_LOGPFX VRRP_LOGPFX_VRID VRRP_LOGPFX_FAM
+				 "Failed to find valid INET address for interface %s",
+				 r->vr->vrid, family2str(r->family),
+				 r->vr->ifp->name);
+			failed = true;
+			goto done;
+		}
+
 		v4 = c->address->u.prefix4;
 
 		ret = setsockopt_ipv4_multicast(r->sock_rx, IP_ADD_MEMBERSHIP,
@@ -2342,7 +2354,7 @@ int vrrp_config_write_global(struct vty *vty)
 		vty_out(vty, "vrrp autoconfigure%s\n",
 			vrrp_autoconfig_version == 2 ? " version 2" : "");
 
-	/* FIXME: needs to be udpated for full YANG conversion. */
+	/* FIXME: needs to be updated for full YANG conversion. */
 	if (vd.priority != VRRP_DEFAULT_PRIORITY && ++writes)
 		vty_out(vty, "vrrp default priority %hhu\n", vd.priority);
 

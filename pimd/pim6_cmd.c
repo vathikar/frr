@@ -93,11 +93,11 @@ DEFPY (no_router_pim6,
 	return nb_cli_apply_changes(vty, NULL);
 }
 
-DEFPY (pim6_joinprune_time,
-       pim6_joinprune_time_cmd,
-       "join-prune-interval (1-65535)$jpi",
-       "Join Prune Send Interval\n"
-       "Seconds\n")
+DEFPY_YANG (pim6_joinprune_time,
+	    pim6_joinprune_time_cmd,
+	    "join-prune-interval (1-65535)$jpi",
+	    "Join Prune Send Interval\n"
+	    "Seconds\n")
 {
 	return pim_process_join_prune_cmd(vty, jpi_str);
 }
@@ -141,15 +141,16 @@ DEFPY_ATTR(ipv6_joinprune_time,
 	return ret;
 }
 
-DEFPY (no_pim6_joinprune_time,
-       no_pim6_joinprune_time_cmd,
-       "no join-prune-interval [(1-65535)]",
-       NO_STR
-       "Join Prune Send Interval\n"
-       IGNORED_IN_NO_STR)
+DEFPY_YANG (no_pim6_joinprune_time,
+	    no_pim6_joinprune_time_cmd,
+	    "no join-prune-interval [(1-65535)]",
+	    NO_STR
+	    "Join Prune Send Interval\n"
+	    IGNORED_IN_NO_STR)
 {
 	return pim_process_no_join_prune_cmd(vty);
 }
+
 DEFPY_ATTR(no_ipv6_pim_joinprune_time,
            no_ipv6_pim_joinprune_time_cmd,
            "no ipv6 pim join-prune-interval [(1-65535)]",
@@ -222,6 +223,23 @@ DEFPY_YANG(if_ipv6_pim_assert_override_interval,
 		nb_cli_enqueue_change(vty, "./assert-override-interval", NB_OP_DESTROY, NULL);
 	else
 		nb_cli_enqueue_change(vty, "./assert-override-interval", NB_OP_MODIFY, at_str);
+
+	return nb_cli_apply_changes(vty, FRR_PIM_INTERFACE_XPATH, FRR_PIM_AF_XPATH_VAL);
+}
+
+DEFPY_YANG(if_ipv6_pim_override_interval,
+           if_ipv6_pim_override_interval_cmd,
+           "[no] ipv6 pim override-interval ![(0-65535)$oi]",
+           NO_STR
+           IPV6_STR
+           PIM_STR
+           "LAN prune delay override interval\n"
+           "Milliseconds, default 2500\n")
+{
+	if (no)
+		nb_cli_enqueue_change(vty, "./override-interval", NB_OP_DESTROY, NULL);
+	else
+		nb_cli_enqueue_change(vty, "./override-interval", NB_OP_MODIFY, oi_str);
 
 	return nb_cli_apply_changes(vty, FRR_PIM_INTERFACE_XPATH, FRR_PIM_AF_XPATH_VAL);
 }
@@ -434,11 +452,11 @@ DEFPY_ATTR(no_ipv6_pim_spt_switchover_infinity_plist,
 	return ret;
 }
 
-DEFPY (pim6_packets,
-       pim6_packets_cmd,
-       "packets (1-255)",
-       "packets to process at one time per fd\n"
-       "Number of packets\n")
+DEFPY_YANG (pim6_packets,
+	    pim6_packets_cmd,
+	    "packets (1-255)",
+	    "packets to process at one time per fd\n"
+	    "Number of packets\n")
 {
 	return pim_process_pim_packet_cmd(vty, packets_str);
 }
@@ -483,12 +501,12 @@ DEFPY_ATTR(ipv6_pim_packets,
 	return ret;
 }
 
-DEFPY (no_pim6_packets,
-       no_pim6_packets_cmd,
-       "no packets [(1-255)]",
-       NO_STR
-       "packets to process at one time per fd\n"
-       IGNORED_IN_NO_STR)
+DEFPY_YANG (no_pim6_packets,
+	    no_pim6_packets_cmd,
+	    "no packets [(1-255)]",
+	    NO_STR
+	    "packets to process at one time per fd\n"
+	    IGNORED_IN_NO_STR)
 {
 	return pim_process_no_pim_packet_cmd(vty);
 }
@@ -534,11 +552,11 @@ DEFPY_ATTR(no_ipv6_pim_packets,
 	return ret;
 }
 
-DEFPY (pim6_keep_alive,
-       pim6_keep_alive_cmd,
-       "keep-alive-timer (1-65535)$kat",
-       "Keep alive Timer\n"
-       "Seconds\n")
+DEFPY_YANG (pim6_keep_alive,
+	    pim6_keep_alive_cmd,
+	    "keep-alive-timer (1-65535)$kat",
+	    "Keep alive Timer\n"
+	    "Seconds\n")
 {
 	return pim_process_keepalivetimer_cmd(vty, kat_str);
 }
@@ -583,12 +601,12 @@ DEFPY_ATTR(ipv6_pim_keep_alive,
 	return ret;
 }
 
-DEFPY (no_pim6_keep_alive,
-       no_pim6_keep_alive_cmd,
-       "no keep-alive-timer [(1-65535)]",
-       NO_STR
-       "Keep alive Timer\n"
-       IGNORED_IN_NO_STR)
+DEFPY_YANG (no_pim6_keep_alive,
+	    no_pim6_keep_alive_cmd,
+	    "no keep-alive-timer [(1-65535)]",
+	    NO_STR
+	    "Keep alive Timer\n"
+	    IGNORED_IN_NO_STR)
 {
 	return pim_process_no_keepalivetimer_cmd(vty);
 }
@@ -634,12 +652,12 @@ DEFPY_ATTR(no_ipv6_pim_keep_alive,
 	return ret;
 }
 
-DEFPY (pim6_rp_keep_alive,
-       pim6_rp_keep_alive_cmd,
-       "rp keep-alive-timer (1-65535)$kat",
-       "Rendezvous Point\n"
-       "Keep alive Timer\n"
-       "Seconds\n")
+DEFPY_YANG (pim6_rp_keep_alive,
+	    pim6_rp_keep_alive_cmd,
+	    "rp keep-alive-timer (1-65535)$kat",
+	    "Rendezvous Point\n"
+	    "Keep alive Timer\n"
+	    "Seconds\n")
 {
 	return pim_process_rp_kat_cmd(vty, kat_str);
 }
@@ -685,13 +703,13 @@ DEFPY_ATTR(ipv6_pim_rp_keep_alive,
 	return ret;
 }
 
-DEFPY (no_pim6_rp_keep_alive,
-       no_pim6_rp_keep_alive_cmd,
-       "no rp keep-alive-timer [(1-65535)]",
-       NO_STR
-       "Rendezvous Point\n"
-       "Keep alive Timer\n"
-       IGNORED_IN_NO_STR)
+DEFPY_YANG (no_pim6_rp_keep_alive,
+	    no_pim6_rp_keep_alive_cmd,
+	    "no rp keep-alive-timer [(1-65535)]",
+	    NO_STR
+	    "Rendezvous Point\n"
+	    "Keep alive Timer\n"
+	    IGNORED_IN_NO_STR)
 {
 	return pim_process_no_rp_kat_cmd(vty);
 }
@@ -738,11 +756,11 @@ DEFPY_ATTR(no_ipv6_pim_rp_keep_alive,
 	return ret;
 }
 
-DEFPY (pim6_register_suppress,
-       pim6_register_suppress_cmd,
-       "register-suppress-time (1-65535)$rst",
-       "Register Suppress Timer\n"
-       "Seconds\n")
+DEFPY_YANG (pim6_register_suppress,
+	    pim6_register_suppress_cmd,
+	    "register-suppress-time (1-65535)$rst",
+	    "Register Suppress Timer\n"
+	    "Seconds\n")
 {
 	return pim_process_register_suppress_cmd(vty, rst_str);
 }
@@ -787,12 +805,12 @@ DEFPY_ATTR(ipv6_pim_register_suppress,
 	return ret;
 }
 
-DEFPY (no_pim6_register_suppress,
-       no_pim6_register_suppress_cmd,
-       "no register-suppress-time [(1-65535)]",
-       NO_STR
-       "Register Suppress Timer\n"
-       IGNORED_IN_NO_STR)
+DEFPY_YANG (no_pim6_register_suppress,
+	    no_pim6_register_suppress_cmd,
+	    "no register-suppress-time [(1-65535)]",
+	    NO_STR
+	    "Register Suppress Timer\n"
+	    IGNORED_IN_NO_STR)
 {
 	return pim_process_no_register_suppress_cmd(vty);
 }
@@ -940,6 +958,19 @@ DEFPY (interface_ipv6_pim_activeactive,
        "Mark interface as Active-Active for MLAG operations\n")
 {
 	return pim_process_ip_pim_activeactive_cmd(vty, no);
+}
+
+DEFPY (interface_ipv6_pim_allowrp,
+       interface_ipv6_pim_allowrp_cmd,
+       "[no] ipv6 pim allow-rp [rp-list PLIST]",
+       NO_STR
+       IPV6_STR
+       PIM_STR
+       "Ignore mismatched RP addresses when processing (*,G) Joins\n"
+       "Specify a prefix-list which the RP address must match in order to be accepted\n"
+       "The prefix-list to check the RP address against\n")
+{
+	return pim_process_ip_pim_allowrp_cmd(vty, no, plist);
 }
 
 /* boundaries */
@@ -1816,6 +1847,29 @@ DEFPY (interface_no_ipv6_mld_query_max_response_time,
        IGNORED_IN_NO_STR)
 {
 	return gm_process_no_query_max_response_time_cmd(vty);
+}
+
+DEFPY_YANG(interface_ipv6_mld_robustness,
+           interface_ipv6_mld_robustness_cmd,
+           "ipv6 mld robustness (1-255)$robustness",
+           IPV6_STR
+           IFACE_MLD_STR
+           "Querier's Robustness Variable\n"
+           "Querier's Robustness Variable\n")
+{
+	return gm_process_robustness_cmd(vty, robustness_str);
+}
+
+DEFPY_YANG(interface_no_ipv6_mld_robustness,
+           interface_no_ipv6_mld_robustness_cmd,
+           "no ipv6 mld robustness [(1-255)]",
+           NO_STR
+           IPV6_STR
+           IFACE_MLD_STR
+           "Querier's Robustness Variable\n"
+           "Querier's Robustness Variable\n")
+{
+	return gm_process_no_robustness_cmd(vty);
 }
 
 DEFPY (interface_ipv6_mld_last_member_query_count,
@@ -3010,6 +3064,24 @@ DEFPY (debug_pimv6_bsm,
 	return CMD_SUCCESS;
 }
 
+DEFPY_YANG(pim6_join_filter_route_map, pim6_join_filter_route_map_cmd,
+	   "[no] join-filter route-map ![RMAP_NAME]$rmap",
+	   NO_STR
+	   "PIM join filter configuration\n"
+	   "Filter PIM joins via route-map\n"
+	   "Route-map name\n")
+{
+	char xpath[XPATH_MAXLEN];
+
+	snprintf(xpath, sizeof(xpath), "./pim-join-route-map");
+	if (no)
+		nb_cli_enqueue_change(vty, xpath, NB_OP_DESTROY, NULL);
+	else
+		nb_cli_enqueue_change(vty, xpath, NB_OP_MODIFY, rmap);
+
+	return nb_cli_apply_changes(vty, NULL);
+}
+
 struct cmd_node pim6_node = {
 	.name = "pim6",
 	.node = PIM6_NODE,
@@ -3092,6 +3164,8 @@ void pim_cmd_init(void)
 	install_element(PIM6_NODE, &pim6_bsr_candidate_rp_group_cmd);
 	install_element(PIM6_NODE, &pim6_bsr_candidate_bsr_cmd);
 
+	install_element(PIM6_NODE, &pim6_join_filter_route_map_cmd);
+
 	install_element(CONFIG_NODE, &ipv6_mld_group_watermark_cmd);
 	install_element(VRF_NODE, &ipv6_mld_group_watermark_cmd);
 	install_element(CONFIG_NODE, &no_ipv6_mld_group_watermark_cmd);
@@ -3105,6 +3179,7 @@ void pim_cmd_init(void)
 	install_element(INTERFACE_NODE, &interface_no_ipv6_pim_hello_cmd);
 	install_element(INTERFACE_NODE, &if_ipv6_pim_joinprune_time_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_activeactive_cmd);
+	install_element(INTERFACE_NODE, &interface_ipv6_pim_allowrp_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_boundary_oil_cmd);
 	install_element(INTERFACE_NODE, &interface_no_ipv6_pim_boundary_oil_cmd);
 	install_element(INTERFACE_NODE, &interface_ipv6_mroute_cmd);
@@ -3113,6 +3188,7 @@ void pim_cmd_init(void)
 	install_element(INTERFACE_NODE, &no_interface_ipv6_mld_limits_cmd);
 	install_element(INTERFACE_NODE, &if_ipv6_pim_assert_interval_cmd);
 	install_element(INTERFACE_NODE, &if_ipv6_pim_assert_override_interval_cmd);
+	install_element(INTERFACE_NODE, &if_ipv6_pim_override_interval_cmd);
 
 	install_element(INTERFACE_NODE, &interface_ipv6_pim_use_source_cmd);
 
@@ -3139,6 +3215,8 @@ void pim_cmd_init(void)
 			&interface_ipv6_mld_query_max_response_time_cmd);
 	install_element(INTERFACE_NODE,
 			&interface_no_ipv6_mld_query_max_response_time_cmd);
+	install_element(INTERFACE_NODE, &interface_ipv6_mld_robustness_cmd);
+	install_element(INTERFACE_NODE, &interface_no_ipv6_mld_robustness_cmd);
 	install_element(INTERFACE_NODE,
 			&interface_ipv6_mld_last_member_query_count_cmd);
 	install_element(INTERFACE_NODE,

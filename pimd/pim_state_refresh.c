@@ -37,7 +37,7 @@ int pim_staterefresh_recv(struct interface *ifp, pim_addr src_addr, uint8_t *buf
 	uint8_t *curr;
 	int curr_size;
 	struct pim_interface *pim_ifp = NULL, *pim_ifp2;
-	struct pim_ifchannel *ch;
+	struct pim_ifchannel *ch, *throwaway;
 	struct listnode *neighnode;
 	struct pim_neighbor *neigh;
 	uint8_t pim_msg[1000];
@@ -117,6 +117,7 @@ int pim_staterefresh_recv(struct interface *ifp, pim_addr src_addr, uint8_t *buf
 	msg_metric.metric_preference &= ~0x80000000;			     /* clear highest bit */
 
 	curr += 4;
+	curr_size -= 4;
 
 	/*
 	 * Parse assert route metric
@@ -125,6 +126,7 @@ int pim_staterefresh_recv(struct interface *ifp, pim_addr src_addr, uint8_t *buf
 	msg_metric.route_metric = pim_read_uint32_host(curr);
 
 	curr += 4;
+	curr_size -= 4;
 
 	if (PIM_DEBUG_PIM_TRACE)
 		zlog_debug("%s: from %pPAs on %s: (S,G)=(%pPAs,%pPAs) pref=%u metric=%u rpt_bit=%u",
@@ -134,10 +136,13 @@ int pim_staterefresh_recv(struct interface *ifp, pim_addr src_addr, uint8_t *buf
 
 	msg_metric.ip_address = src_addr;
 
-	struct pim_staterefresh_header *header = (struct pim_staterefresh_header *)curr;
+	if ((size_t)curr_size < (size_t)sizeof(struct pim_staterefresh_header)) {
+		zlog_warn("%s: Message length left %d is less than sizeof pim_staterefresh_header %zu",
+			  __func__, curr_size, sizeof(struct pim_staterefresh_header));
+		return -4;
+	}
 
-	pim_ifp = ifp->info;
-	assert(pim_ifp);
+	struct pim_staterefresh_header *header = (struct pim_staterefresh_header *)curr;
 
 	if (pim_ifp->pim_passive_enable) {
 		if (PIM_DEBUG_PIM_PACKETS)
@@ -160,7 +165,7 @@ int pim_staterefresh_recv(struct interface *ifp, pim_addr src_addr, uint8_t *buf
 		pim_ifp2 = neigh->interface->info;
 		if (pim_is_group_filtered(pim_ifp2, &up->sg.grp, &up->sg.src))
 			continue;
-		ch = pim_ifchannel_find(neigh->interface, &up->sg);
+		pim_ifchannel_find(neigh->interface, &up->sg, &ch, &throwaway);
 		if (!ch)
 			p = 0;
 		else {
@@ -274,7 +279,7 @@ void pim_send_staterefresh(struct pim_upstream *up)
 	int pim_msg_size;
 	struct interface *ifp, *ifp2 = NULL;
 	struct pim_interface *pim_ifp2;
-	struct pim_ifchannel *ch;
+	struct pim_ifchannel *ch, *throwaway;
 	struct listnode *neighnode;
 	struct pim_neighbor *neigh;
 
@@ -301,7 +306,7 @@ void pim_send_staterefresh(struct pim_upstream *up)
 			continue;
 
 		if (HAVE_DENSE_MODE(pim_ifp2->pim_mode) && ifp2->ifindex != ifp->ifindex) {
-			ch = pim_ifchannel_find(ifp2, &up->sg);
+			pim_ifchannel_find(ifp2, &up->sg, &ch, &throwaway);
 			if (!ch)
 				p = 0;
 			else

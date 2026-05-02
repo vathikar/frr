@@ -828,7 +828,7 @@ void ospf6_asbr_lsa_remove(struct ospf6_lsa *lsa,
 			struct ospf6_path *o_path;
 			bool nh_updated = false;
 
-			/* Iterate all paths of route to find maching with LSA
+			/* Iterate all paths of route to find matching with LSA
 			 * remove from route path list. If route->path is same,
 			 * replace from paths list.
 			 */
@@ -1034,6 +1034,25 @@ void ospf6_asbr_lsentry_remove(struct ospf6_route *asbr_entry,
 	router = ospf6_linkstate_prefix_adv_router(&asbr_entry->prefix);
 	for (ALL_LSDB_TYPED_ADVRTR(ospf6->lsdb, type, router, lsa))
 		ospf6_asbr_lsa_remove(lsa, asbr_entry);
+}
+
+void ospf6_asbr_recalculate_external_routes(struct ospf6 *ospf6)
+{
+	struct ospf6_lsa *lsa, *lsanext;
+
+	for (ALL_LSDB(ospf6->lsdb, lsa, lsanext)) {
+		if (ntohs(lsa->header->type) != OSPF6_LSTYPE_AS_EXTERNAL ||
+		    OSPF6_LSA_IS_MAXAGE(lsa))
+			continue;
+
+		/*
+		 * Forwarding-address reachability may change when non-external
+		 * routes are updated. Re-run remove/add to keep external route
+		 * installation in sync with current topology.
+		 */
+		ospf6_asbr_lsa_remove(lsa, NULL);
+		ospf6_asbr_lsa_add(lsa);
+	}
 }
 
 
@@ -2951,7 +2970,7 @@ ospf6_originate_summary_lsa(struct ospf6 *ospf6,
 			   __func__, &aggr->p);
 
 	/* This case to handle when the overlapping aggregator address
-	 * is available. Best match will be considered.So need to delink
+	 * is available. Best match will be considered.So need to unlink
 	 * from old aggregator and link to the new aggr.
 	 */
 	if (rt->aggr_route) {
@@ -3343,7 +3362,7 @@ static void ospf6_handle_aggregated_exnl_rt(struct ospf6 *ospf6,
 	struct ospf6_external_info *info;
 
 	/* Handling the case where the external route prefix
-	 * and aggegate prefix is same
+	 * and aggregate prefix is same
 	 * If same don't flush the originated external LSA.
 	 */
 	if (prefix_same(&aggr->p, &rt->prefix)) {
@@ -3713,7 +3732,7 @@ void ospf6_handle_external_lsa_origination(struct ospf6 *ospf6,
 
 			/* Handling the case where the
 			 * external route prefix
-			 * and aggegate prefix is same
+			 * and aggregate prefix is same
 			 * If same don't flush the
 			 * originated
 			 * external LSA.

@@ -55,7 +55,7 @@ struct ospf_path {
 */
 
 struct route_standard {
-	/* Link Sate Origin. */
+	/* Link State Origin. */
 	struct lsa_header *origin;
 
 	/* Associated Area. */
@@ -112,6 +112,7 @@ struct ospf_route {
 		struct route_external ext;
 	} u;
 
+	bool connected;
 	bool changed;
 };
 

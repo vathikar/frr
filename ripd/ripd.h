@@ -104,6 +104,9 @@ struct rip {
 	/* Status of the routing instance. */
 	bool enabled;
 
+	/* Log neighbor changes enabled or not. */
+	bool log_neighbor_changes;
+
 	/* RIP socket. */
 	int sock;
 
@@ -416,7 +419,7 @@ struct rip_md5_data {
 	uint8_t digest[16];
 };
 
-/* RIP accepet/announce methods. */
+/* RIP accept/announce methods. */
 #define RI_RIP_UNSPEC                      0
 #define RI_RIP_VERSION_1                   1
 #define RI_RIP_VERSION_2                   2

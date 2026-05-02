@@ -33,6 +33,8 @@ DECLARE_MTYPE(VLAN_CHANGE_ARR);
  */
 uint32_t zebra_dplane_get_version(void);
 
+uint32_t zebra_dplane_get_work_limit(void);
+
 /* Key netlink info from zebra ns */
 struct zebra_dplane_info {
 	ns_id_t ns_id;
@@ -328,6 +330,9 @@ void dplane_ctx_enqueue_tail(struct dplane_ctx_list_head *q,
 void dplane_ctx_list_append(struct dplane_ctx_list_head *to_list,
 			    struct dplane_ctx_list_head *from_list);
 
+uint32_t dplane_ctx_list_append_count_max(struct dplane_ctx_list_head *to_list,
+					  struct dplane_ctx_list_head *from_list, uint32_t limit);
+
 /* Dequeue a context block from the head of caller's tailq */
 struct zebra_dplane_ctx *dplane_ctx_dequeue(struct dplane_ctx_list_head *q);
 struct zebra_dplane_ctx *dplane_ctx_get_head(struct dplane_ctx_list_head *q);
@@ -524,6 +529,8 @@ void dplane_ctx_set_instance(struct zebra_dplane_ctx *ctx, uint16_t instance);
 uint16_t dplane_ctx_get_old_instance(const struct zebra_dplane_ctx *ctx);
 uint32_t dplane_ctx_get_flags(const struct zebra_dplane_ctx *ctx);
 void dplane_ctx_set_flags(struct zebra_dplane_ctx *ctx, uint32_t flags);
+bool dplane_ctx_route_get_replace(const struct zebra_dplane_ctx *ctx);
+void dplane_ctx_route_set_replace(struct zebra_dplane_ctx *ctx, bool replace);
 uint32_t dplane_ctx_get_metric(const struct zebra_dplane_ctx *ctx);
 uint32_t dplane_ctx_get_old_metric(const struct zebra_dplane_ctx *ctx);
 void dplane_ctx_set_route_metric(struct zebra_dplane_ctx *ctx, uint32_t metric);

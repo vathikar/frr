@@ -346,11 +346,10 @@ static unsigned int updgrp_hash_key_make(const void *p)
 	key = 0;
 
 	/* `remote-as auto` technically uses identical peer->sort.
-	 * After OPEN message is parsed, this is updated accordingly, but
-	 * we need to call the peer_sort() here also to properly create
-	 * separate subgroups.
+	 * After OPEN message is parsed, peer->sort is updated accordingly in
+	 * update_group_create, so we directly use it.
 	 */
-	key = jhash_1word(peer_sort((struct peer *)peer), key);
+	key = jhash_1word(peer->sort, key);
 	key = jhash_1word(peer->sub_sort, key); /* OAD */
 	key = jhash_1word((peer->flags & PEER_UPDGRP_FLAGS), key);
 	key = jhash_1word((flags & PEER_UPDGRP_AF_FLAGS), key);
@@ -472,6 +471,10 @@ static unsigned int updgrp_hash_key_make(const void *p)
 	if (afi == AFI_IP6 &&
 	    (CHECK_FLAG(peer->af_flags[afi][safi], PEER_FLAG_NEXTHOP_LOCAL_UNCHANGED)))
 		key = jhash(&peer->nexthop.v6_global, IPV6_MAX_BYTELEN, key);
+
+	key = jhash_1word(CHECK_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV4), key);
+
+	key = jhash_1word(CHECK_FLAG(peer->af_flags[AFI_BGP_LS][SAFI_BGP_LS], PEER_FLAG_BGP_LS_IPV6), key);
 
 	/*
 	 * ANY NEW ITEMS THAT ARE ADDED TO THE key, ENSURE DEBUG
@@ -607,6 +610,10 @@ static bool updgrp_hash_cmp(const void *p1, const void *p2)
 	    != (pe2->cap & PEER_UPDGRP_CAP_FLAGS))
 		return false;
 
+	/* For aspath loop detection, the remote-as should match */
+	if (CHECK_FLAG(pe1->flags, PEER_FLAG_AS_LOOP_DETECTION) && (pe1->as != pe2->as))
+		return false;
+
 	if ((pe1->af_cap[afi][safi] & PEER_UPDGRP_AF_CAP_FLAGS)
 	    != (pe2->af_cap[afi][safi] & PEER_UPDGRP_AF_CAP_FLAGS))
 		return false;
@@ -739,6 +746,7 @@ static int update_group_show_walkcb(struct update_group *updgrp, void *arg)
 	json_object *json_pkt_info = NULL;
 	time_t epoch_tbuf, tbuf;
 	char timebuf[32];
+	char time_buf[64];
 
 	if (!ctx)
 		return CMD_SUCCESS;
@@ -781,6 +789,11 @@ static int update_group_show_walkcb(struct update_group *updgrp, void *arg)
 				       afi2str(updgrp->afi));
 		json_object_string_add(json_updgrp, "safi",
 				       safi2str(updgrp->safi));
+		/* Calculate createtime and convert it into dd:hh:mm:ss display
+		 * format
+		 */
+		time_to_date_string(updgrp->uptime, time_buf, sizeof(time_buf));
+		json_object_string_add(json_updgrp, "grpCreateTimeStr", time_buf);
 	} else {
 		vty_out(vty, "Update-group %" PRIu64 ":\n", updgrp->id);
 		vty_out(vty, "  Created: %s", time_to_string(updgrp->uptime, timebuf));
@@ -854,6 +867,11 @@ static int update_group_show_walkcb(struct update_group *updgrp, void *arg)
 					       time_to_string_json(subgrp->uptime, timebuf));
 			json_object_object_add(json_subgrp, "groupCreateTime",
 					       json_subgrp_time);
+			/* Calculate subgrp createtime and convert it into
+			 * dd:hh:mm:ss display format
+			 */
+			time_to_date_string(subgrp->uptime, time_buf, sizeof(time_buf));
+			json_object_string_add(json_subgrp, "subGrpCreateTimeStr", time_buf);
 		} else {
 			vty_out(vty, "\n");
 			vty_out(vty, "  Update-subgroup %" PRIu64 ":\n",
@@ -1070,6 +1088,8 @@ static struct update_group *update_group_create(struct peer_af *paf)
 	struct update_group tmp;
 	struct peer tmp_conf;
 	struct peer_connection tmp_connection;
+
+	(void)peer_sort(paf->peer);
 
 	memset(&tmp, 0, sizeof(tmp));
 	memset(&tmp_conf, 0, sizeof(tmp_conf));
@@ -1738,7 +1758,7 @@ static int updgrp_policy_update_walkcb(struct update_group *updgrp, void *arg)
 	}
 
 	UPDGRP_FOREACH_SUBGRP (updgrp, subgrp) {
-		/* Avoid supressing duplicate routes later
+		/* Avoid suppressing duplicate routes later
 		 * when processing in subgroup_announce_table().
 		 */
 		SET_FLAG(subgrp->sflags, SUBGRP_STATUS_FORCE_UPDATES);
@@ -2213,7 +2233,7 @@ void update_group_refresh_default_originate_route_map(struct event *event)
  *
  * If the combine parameter is true, then this function will try to
  * gather other peers in the subgroup for which a route announcement
- * is pending and efficently announce routes to all of them.
+ * is pending and efficiently announce routes to all of them.
  *
  * For now, the 'combine' option has an effect only if all peers in
  * the subgroup have a route announcement pending.
@@ -2252,7 +2272,7 @@ void peer_af_announce_route(struct peer_af *paf, int combine)
 	}
 	/*
 	 * Announce to the peer alone if we were not asked to combine peers,
-	 * or if some peers don't have a route annoucement pending.
+	 * or if some peers don't have a route announcement pending.
 	 */
 	if (!combine || !all_pending) {
 		update_subgroup_split_peer(paf, NULL);

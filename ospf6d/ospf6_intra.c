@@ -675,6 +675,7 @@ void ospf6_link_lsa_originate(struct event *event)
 	struct ospf6_link_lsa *link_lsa;
 	struct ospf6_route *route;
 	struct ospf6_prefix *op;
+	unsigned int prefix_num = 0;
 
 	oi = (struct ospf6_interface *)EVENT_ARG(event);
 
@@ -724,20 +725,33 @@ void ospf6_link_lsa_originate(struct event *event)
 	memcpy(link_lsa->options, oi->area->options, 3);
 	memcpy(&link_lsa->linklocal_addr, oi->linklocal_addr,
 	       sizeof(struct in6_addr));
-	link_lsa->prefix_num = htonl(oi->route_connected->count);
 
 	op = lsdesc_start_lsa_type(lsa_header, OSPF6_LSTYPE_LINK);
 
 	/* connected prefix to advertise */
 	for (route = ospf6_route_head(oi->route_connected); route;
 	     route = ospf6_route_next(route)) {
+		/* Check buffer overflow before writing prefix */
+		if ((size_t)((char *)op - buffer) + OSPF6_PREFIX_SPACE(route->prefix.prefixlen) +
+			    sizeof(struct ospf6_prefix) >=
+		    sizeof(buffer)) {
+			zlog_warn("%s: Interface %s has too many prefixes, truncating at %u of %u",
+				  __func__, oi->interface->name, prefix_num,
+				  oi->route_connected->count);
+			break;
+		}
+
 		op->prefix_length = route->prefix.prefixlen;
 		op->prefix_options = route->prefix_options;
 		op->prefix_metric = htons(0);
 		memcpy(OSPF6_PREFIX_BODY(op), &route->prefix.u.prefix6,
 		       OSPF6_PREFIX_SPACE(op->prefix_length));
 		op = OSPF6_PREFIX_NEXT(op);
+		prefix_num++;
 	}
+
+	/* Update actual prefix count */
+	link_lsa->prefix_num = htonl(prefix_num);
 
 	/* Fill LSA Header */
 	lsa_header->age = 0;
@@ -1241,6 +1255,16 @@ void ospf6_intra_prefix_lsa_originate_transit(struct event *event)
 	prefix_num = 0;
 	for (route = ospf6_route_head(route_advertise); route;
 	     route = ospf6_route_best_next(route)) {
+		/* Check buffer overflow before writing prefix */
+		if ((size_t)((char *)op - buffer) + OSPF6_PREFIX_SPACE(route->prefix.prefixlen) +
+			    sizeof(struct ospf6_prefix) >=
+		    sizeof(buffer)) {
+			zlog_warn("%s: Interface %s has too many transit prefixes, truncating at %u of %u",
+				  __func__, oi->interface->name, prefix_num,
+				  route_advertise->count);
+			break;
+		}
+
 		op->prefix_length = route->prefix.prefixlen;
 		op->prefix_options = route->prefix_options;
 		op->prefix_metric = htons(0);
@@ -1508,6 +1532,7 @@ void ospf6_intra_prefix_route_ecmp_path(struct ospf6_area *oa,
 
 			for (ALL_LIST_ELEMENTS_RO(old_route->paths, anode,
 						  o_path)) {
+				ifp = NULL;
 				ls_entry = ospf6_route_lookup(
 							&o_path->ls_prefix,
 							oa->spf_table);
@@ -1689,6 +1714,8 @@ void ospf6_intra_prefix_lsa_add(struct ospf6_lsa *lsa)
 			ls_entry->path.cost + ntohs(op->prefix_metric);
 		memcpy(&route->path.ls_prefix, &ls_prefix,
 		       sizeof(struct prefix));
+		if (ls_entry->connected)
+			route->connected = true;
 		if (direct_connect) {
 			ifp = if_lookup_prefix(&route->prefix,
 					       oa->ospf6->vrf_id);
@@ -1751,7 +1778,7 @@ static void ospf6_intra_prefix_lsa_remove_update_route(struct ospf6_lsa *lsa,
 	bool nh_updated = false;
 	char buf[PREFIX2STR_BUFFER];
 
-	/* Iterate all paths of route to find maching
+	/* Iterate all paths of route to find matching
 	 * with LSA remove info.
 	 * If route->path is same, replace
 	 * from paths list.

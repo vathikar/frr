@@ -386,7 +386,7 @@ static void ospf_passive_interface_update(struct interface *ifp,
 	 * work to determine this set, so we do this for every interface.
 	 * This is safe and reasonable because ospf_if_set_multicast uses a
 	 * record of joined groups to avoid systems calls if the desired
-	 * memberships match the current memership.
+	 * memberships match the current membership.
 	 */
 
 	for (rn = route_top(IF_OIFS(ifp)); rn; rn = route_next(rn)) {
@@ -1095,7 +1095,7 @@ DEFUN (ospf_area_vlink,
 	}
 
 	if (argc <= 4) {
-		/* Thats all folks! - BUGS B. strikes again!!!*/
+		/* That's all folks! - BUGS B. strikes again!!!*/
 
 		return ospf_vl_set(ospf, &vl_config);
 	}
@@ -1189,13 +1189,13 @@ DEFUN (no_ospf_area_vlink,
 
 	if (argc <= 5) {
 		/* Basic VLink no command */
-		/* Thats all folks! - BUGS B. strikes again!!!*/
+		/* That's all folks! - BUGS B. strikes again!!!*/
 		ospf_vl_delete(ospf, vl_data);
 		ospf_area_check_free(ospf, vl_config.area_id);
 		return CMD_SUCCESS;
 	}
 
-	/* If we are down here, we are reseting parameters */
+	/* If we are down here, we are resetting parameters */
 	/* Deal with other parameters */
 
 	if (argv_find(argv, argc, "authentication", &idx)) {
@@ -9050,7 +9050,7 @@ DEFUN (ip_ospf_area,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	// Check if we have an address arg and proccess it
+	// Check if we have an address arg and process it
 	if (argc == idx + 3) {
 		if (!inet_aton(argv[idx + 2]->arg, &addr)) {
 			vty_out(vty,
@@ -9116,7 +9116,7 @@ DEFUN (no_ip_ospf_area,
 
 	argv_find(argv, argc, "area", &idx);
 
-	// Check if we have an address arg and proccess it
+	// Check if we have an address arg and process it
 	if (argc == idx + 3) {
 		if (!inet_aton(argv[idx + 2]->arg, &addr)) {
 			vty_out(vty,
@@ -13609,7 +13609,9 @@ DEFUN (clear_ip_ospf_interface,
 		/* Interface name is specified. */
 		ifp = if_lookup_by_name(argv[idx_ifname]->arg, vrf_id);
 		if (ifp == NULL)
-			vty_out(vty, "No such interface name\n");
+			vty_out(vty, "%% No such interface name\n");
+		else if (ospf_oi_count(ifp) == 0)
+			vty_out(vty, "%% OSPF not enabled on this interface\n");
 		else
 			ospf_interface_clear(ifp);
 	}

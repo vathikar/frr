@@ -108,6 +108,20 @@ enum pta_type {
 	PMSI_TNLTYPE_MAX = PMSI_TNLTYPE_MLDP_MP2MP
 };
 
+/* Hard limit on sub-TLVs within a single Tunnel Encap attribute (RFC 9012).
+ * Prevents a peer from driving unbounded XCALLOC churn with valid packets.
+ * This is not defined in the RFC, but is a sanity check to prevent memory
+ * exhaustion.
+ * Adding 64, just as a sanity number (I doubt more than 64 TLVs is a valid
+ * case in real life...).
+ */
+#define BGP_ENCAP_SUBTLV_MAX 64
+
+/* PMSI lengths for label-only, ipv4, and ipv6 "identifier" */
+#define BGP_ATTR_PMSI_TUNNEL_LBL_ONLY_LEN 5
+#define BGP_ATTR_PMSI_TUNNEL_V4_LENGTH    9
+#define BGP_ATTR_PMSI_TUNNEL_V6_LENGTH    21
+
 /*
  * Prefix-SID type-4
  * SRv6-VPN-SID-TLV
@@ -183,6 +197,19 @@ struct attr {
 	/* Distance as applied by Route map */
 	uint8_t distance;
 
+	uint8_t df_alg;
+
+	/* EVPN flags */
+	uint8_t evpn_flags;
+#define ATTR_EVPN_FLAG_STICKY	  (1 << 0)
+#define ATTR_EVPN_FLAG_DEFAULT_GW (1 << 1)
+/* NA router flag (R-bit) support in EVPN */
+#define ATTR_EVPN_FLAG_ROUTER (1 << 2)
+
+	/* has the route-map changed any attribute?
+	   Used on the peer outbound side. */
+	uint16_t rmap_change_flags;
+
 	/* Cache to avoid repeated interning within a single UPDATE section */
 	struct {
 		bool valid;
@@ -195,15 +222,16 @@ struct attr {
 	} attr_intern_reuse;
 
 	/* EVPN DF preference for DF election on local ESs */
-	uint8_t df_alg;
 	uint16_t df_pref;
+
+	/* MP Nexthop length */
+	uint8_t mp_nexthop_len;
+
+	uint16_t encap_tunneltype;
 
 	/* PMSI tunnel type (RFC 6514). */
 	enum pta_type pmsi_tnl_type;
-
-	/* has the route-map changed any attribute?
-	   Used on the peer outbound side. */
-	uint16_t rmap_change_flags;
+	struct in6_addr tunn_id; /* PMSI Tunnel Id */
 
 	/* Multi-Protocol Nexthop, AFI IPv6 */
 	struct in6_addr mp_nexthop_global;
@@ -244,21 +272,14 @@ struct attr {
 	/* Aggregator ASN */
 	as_t aggregator_as;
 
-	/* MP Nexthop length */
-	uint8_t mp_nexthop_len;
-
-	/* EVPN flags */
-	uint8_t evpn_flags;
-#define ATTR_EVPN_FLAG_STICKY	  (1 << 0)
-#define ATTR_EVPN_FLAG_DEFAULT_GW (1 << 1)
-/* NA router flag (R-bit) support in EVPN */
-#define ATTR_EVPN_FLAG_ROUTER (1 << 2)
-
 	/* route tag */
 	route_tag_t tag;
 
 	/* Label index */
 	uint32_t label_index;
+
+	/* rmap set table */
+	uint32_t rmap_table_id;
 
 	/* SRv6 VPN SID */
 	struct bgp_attr_srv6_vpn *srv6_vpn;
@@ -287,11 +308,6 @@ struct attr {
 	/* EVPN local router-mac */
 	struct ethaddr rmac;
 
-	uint8_t encap_tunneltype;
-
-	/* rmap set table */
-	uint32_t rmap_table_id;
-
 	/* Link bandwidth value, if any. */
 	uint64_t link_bw;
 
@@ -315,6 +331,9 @@ struct attr {
 
 	/* Next-hop characteristics */
 	struct bgp_nhc *nhc;
+
+	/* For BGP-LS Attribute (RFC 9552) */
+	struct bgp_ls_attr *ls_attr;
 };
 
 /* rmap_change_flags definition */
@@ -379,9 +398,9 @@ struct bpacket_attr_vec_arr;
 /* Prototypes. */
 extern void bgp_attr_init(void);
 extern void bgp_attr_finish(void);
-extern enum bgp_attr_parse_ret
-bgp_attr_parse(struct peer *peer, struct attr *attr, bgp_size_t size,
-	       struct bgp_nlri *mp_update, struct bgp_nlri *mp_withdraw);
+extern enum bgp_attr_parse_ret bgp_attr_parse(struct peer_connection *connection, struct attr *attr,
+					      bgp_size_t size, struct bgp_nlri *mp_update,
+					      struct bgp_nlri *mp_withdraw);
 extern struct attr *bgp_attr_intern(struct attr *attr);
 extern struct bgp_attr_srv6_l3service *
 bgp_attr_srv6_l3service_intern(struct bgp_attr_srv6_l3service *vpn);
@@ -397,12 +416,14 @@ extern struct attr *bgp_attr_aggregate_intern(
 	struct community *community, struct ecommunity *ecommunity,
 	struct lcommunity *lcommunity, struct bgp_aggregate *aggregate,
 	uint8_t atomic_aggregate, const struct prefix *p);
-extern bgp_size_t
-bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct stream *s, struct attr *attr,
-		     struct bpacket_attr_vec_arr *vecarr, struct prefix *p, afi_t afi, safi_t safi,
-		     struct peer *from, struct prefix_rd *prd, mpls_label_t *label,
-		     uint8_t num_labels, struct bgp_attr_srv6_l3service *srv6_unicast,
-		     bool addpath_capable, uint32_t addpath_tx_id, struct bgp_path_info *bpi);
+extern bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct stream *s,
+				       struct attr *attr, struct bpacket_attr_vec_arr *vecarr,
+				       struct prefix *p, afi_t afi, safi_t safi, struct peer *from,
+				       struct prefix_rd *prd, mpls_label_t *label,
+				       uint8_t num_labels,
+				       struct bgp_attr_srv6_l3service *srv6_unicast,
+				       bool addpath_capable, uint32_t addpath_tx_id,
+				       struct bgp_path_info *bpi, struct bgp_ls_nlri *ls_nlri);
 extern void bgp_dump_routes_attr(struct stream *s, struct bgp_path_info *bpi,
 				 const struct prefix *p);
 extern bool attrhash_cmp(const void *arg1, const void *arg2);
@@ -459,17 +480,19 @@ extern size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer,
 extern void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi,
 				     const struct prefix *p, const struct prefix_rd *prd,
 				     mpls_label_t *label, uint8_t num_labels, bool addpath_capable,
-				     uint32_t addpath_tx_id, struct attr *attr);
+				     uint32_t addpath_tx_id, struct attr *attr,
+				     struct bgp_ls_nlri *ls_nlri);
 extern size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 					    const struct prefix *p);
 extern void bgp_packet_mpattr_end(struct stream *s, size_t sizep);
 
 extern size_t bgp_packet_mpunreach_start(struct stream *s, afi_t afi,
 					 safi_t safi);
-extern void bgp_packet_mpunreach_prefix(
-	struct stream *s, const struct prefix *p, afi_t afi, safi_t safi,
-	const struct prefix_rd *prd, mpls_label_t *label, uint8_t num_labels,
-	bool addpath_capable, uint32_t addpath_tx_id, struct attr *attr);
+extern void bgp_packet_mpunreach_prefix(struct stream *s, const struct prefix *p, afi_t afi,
+					safi_t safi, const struct prefix_rd *prd,
+					mpls_label_t *label, uint8_t num_labels,
+					bool addpath_capable, uint32_t addpath_tx_id,
+					struct attr *attr, struct bgp_ls_nlri *ls_nlri);
 extern void bgp_packet_mpunreach_end(struct stream *s, size_t attrlen_pnt);
 
 extern enum bgp_attr_parse_ret bgp_attr_nexthop_valid(struct peer *peer,
@@ -477,21 +500,16 @@ extern enum bgp_attr_parse_ret bgp_attr_nexthop_valid(struct peer *peer,
 
 extern uint32_t bgp_attr_get_color(struct attr *attr);
 
-static inline bool bgp_rmap_nhop_changed(uint32_t out_rmap_flags,
-					 uint32_t in_rmap_flags)
+static inline bool bgp_rmap_nhop_changed(uint32_t out_rmap_flags)
 {
 	return ((CHECK_FLAG(out_rmap_flags, BATTR_RMAP_NEXTHOP_PEER_ADDRESS) ||
 		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_NEXTHOP_UNCHANGED) ||
 		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_IPV4_NHOP_CHANGED) ||
 		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_VPNV4_NHOP_CHANGED) ||
-		 CHECK_FLAG(out_rmap_flags,
-			    BATTR_RMAP_VPNV6_GLOBAL_NHOP_CHANGED) ||
-		 CHECK_FLAG(out_rmap_flags,
-			    BATTR_RMAP_IPV6_GLOBAL_NHOP_CHANGED) ||
-		 CHECK_FLAG(out_rmap_flags,
-			    BATTR_RMAP_IPV6_PREFER_GLOBAL_CHANGED) ||
-		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_IPV6_LL_NHOP_CHANGED) ||
-		 CHECK_FLAG(in_rmap_flags, BATTR_RMAP_NEXTHOP_UNCHANGED))
+		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_VPNV6_GLOBAL_NHOP_CHANGED) ||
+		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_IPV6_GLOBAL_NHOP_CHANGED) ||
+		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_IPV6_PREFER_GLOBAL_CHANGED) ||
+		 CHECK_FLAG(out_rmap_flags, BATTR_RMAP_IPV6_LL_NHOP_CHANGED))
 			? true
 			: false);
 }
@@ -501,7 +519,7 @@ static inline uint32_t mac_mobility_seqnum(struct attr *attr)
 	return (attr) ? attr->mm_seqnum : 0;
 }
 
-static inline enum pta_type bgp_attr_get_pmsi_tnl_type(struct attr *attr)
+static inline enum pta_type bgp_attr_get_pmsi_tnl_type(const struct attr *attr)
 {
 	return attr->pmsi_tnl_type;
 }
